@@ -1,13 +1,18 @@
 //! PostgreSQL store for persisting agent data.
 
 use chrono::{DateTime, Utc};
+#[cfg(feature = "postgres")]
 use deadpool_postgres::{Config, Pool, Runtime};
 use rust_decimal::Decimal;
+#[cfg(feature = "postgres")]
 use tokio_postgres::NoTls;
 use uuid::Uuid;
 
+#[cfg(feature = "postgres")]
 use crate::config::DatabaseConfig;
+#[cfg(feature = "postgres")]
 use crate::context::{ActionRecord, JobContext, JobState};
+#[cfg(feature = "postgres")]
 use crate::error::DatabaseError;
 
 /// Record for an LLM call to be persisted.
@@ -24,10 +29,12 @@ pub struct LlmCallRecord<'a> {
 }
 
 /// Database store for the agent.
+#[cfg(feature = "postgres")]
 pub struct Store {
     pool: Pool,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Create a new store and connect to the database.
     pub async fn new(config: &DatabaseConfig) -> Result<Self, DatabaseError> {
@@ -144,7 +151,12 @@ impl Store {
                 actual_cost, repair_attempts, created_at, started_at, completed_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
             ON CONFLICT (id) DO UPDATE SET
+                title = EXCLUDED.title,
+                description = EXCLUDED.description,
+                category = EXCLUDED.category,
                 status = EXCLUDED.status,
+                estimated_cost = EXCLUDED.estimated_cost,
+                estimated_time_secs = EXCLUDED.estimated_time_secs,
                 actual_cost = EXCLUDED.actual_cost,
                 repair_attempts = EXCLUDED.repair_attempts,
                 started_at = EXCLUDED.started_at,
@@ -464,6 +476,7 @@ pub struct SandboxJobSummary {
     pub interrupted: usize,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Insert a new sandbox job into `agent_jobs`.
     pub async fn save_sandbox_job(&self, job: &SandboxJobRecord) -> Result<(), DatabaseError> {
@@ -656,6 +669,7 @@ pub struct JobEventRecord {
     pub created_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Persist a job event (fire-and-forget from orchestrator handler).
     pub async fn save_job_event(
@@ -728,10 +742,12 @@ impl Store {
 
 // ==================== Routines ====================
 
+#[cfg(feature = "postgres")]
 use crate::agent::routine::{
     NotifyConfig, Routine, RoutineAction, RoutineGuardrails, RoutineRun, RunStatus, Trigger,
 };
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Create a new routine.
     pub async fn create_routine(&self, routine: &Routine) -> Result<(), DatabaseError> {
@@ -1032,6 +1048,7 @@ impl Store {
     }
 }
 
+#[cfg(feature = "postgres")]
 fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
     let trigger_type: String = row.get("trigger_type");
     let trigger_config: serde_json::Value = row.get("trigger_config");
@@ -1076,6 +1093,7 @@ fn row_to_routine(row: &tokio_postgres::Row) -> Result<Routine, DatabaseError> {
     })
 }
 
+#[cfg(feature = "postgres")]
 fn row_to_routine_run(row: &tokio_postgres::Row) -> Result<RoutineRun, DatabaseError> {
     let status_str: String = row.get("status");
     let status: RunStatus = status_str
@@ -1121,6 +1139,7 @@ pub struct ConversationMessage {
     pub created_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Ensure a conversation row exists for a given UUID.
     ///
@@ -1375,6 +1394,7 @@ impl Store {
     }
 }
 
+#[cfg(feature = "postgres")]
 fn parse_job_state(s: &str) -> JobState {
     match s {
         "pending" => JobState::Pending,
@@ -1391,8 +1411,10 @@ fn parse_job_state(s: &str) -> JobState {
 
 // ==================== Tool Failures ====================
 
+#[cfg(feature = "postgres")]
 use crate::agent::BrokenTool;
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Record a tool failure (upsert: increment count if exists).
     pub async fn record_tool_failure(
@@ -1486,6 +1508,7 @@ pub struct SettingRow {
     pub updated_at: DateTime<Utc>,
 }
 
+#[cfg(feature = "postgres")]
 impl Store {
     /// Get a single setting by key.
     pub async fn get_setting(

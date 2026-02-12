@@ -2526,7 +2526,7 @@ mod tests {
         creds.insert("OTHER_SECRET".to_string(), "s3cret".to_string());
 
         let store =
-            ChannelStoreData::new(1024 * 1024, "test", ChannelCapabilities::default(), creds);
+            ChannelStoreData::new(1024 * 1024, "test", ChannelCapabilities::default(), creds, Arc::new(PairingStore::new()));
 
         let error = "HTTP request failed: error sending request for url \
             (https://api.telegram.org/bot8218490433:AAEZeUxwqZ5OO3mOCXv7fKvpdhDgsmBBNis/getUpdates)";
@@ -2556,6 +2556,7 @@ mod tests {
             "test",
             ChannelCapabilities::default(),
             std::collections::HashMap::new(),
+            Arc::new(PairingStore::new()),
         );
 
         let input = "some error message";
@@ -2570,7 +2571,7 @@ mod tests {
         creds.insert("EMPTY_TOKEN".to_string(), String::new());
 
         let store =
-            ChannelStoreData::new(1024 * 1024, "test", ChannelCapabilities::default(), creds);
+            ChannelStoreData::new(1024 * 1024, "test", ChannelCapabilities::default(), creds, Arc::new(PairingStore::new()));
 
         let input = "should not match anything";
         assert_eq!(store.redact_credentials(input), input);

@@ -18,21 +18,19 @@ use ironclaw::{
         web::log_layer::{LogBroadcaster, WebLogLayer},
     },
     cli::{
-        Cli, Command, run_mcp_command, run_memory_command, run_pairing_command, run_status_command,
+        Cli, Command, run_mcp_command, run_pairing_command, run_status_command,
         run_tool_command,
     },
     config::Config,
     context::ContextManager,
     extensions::ExtensionManager,
-    history::Store,
     llm::{SessionConfig, create_llm_provider, create_session_manager},
     orchestrator::{
         ContainerJobConfig, ContainerJobManager, OrchestratorApi, TokenStore,
         api::OrchestratorState,
     },
     safety::SafetyLayer,
-    secrets::{PostgresSecretsStore, SecretsCrypto, SecretsStore},
-    setup::{SetupConfig, SetupWizard},
+    secrets::SecretsStore,
     tools::{
         ToolRegistry,
         mcp::{McpClient, McpSessionManager, config::load_mcp_servers_from_db, is_authenticated},
@@ -40,6 +38,14 @@ use ironclaw::{
     },
     workspace::{EmbeddingProvider, NearAiEmbeddings, OpenAiEmbeddings, Workspace},
 };
+
+use ironclaw::secrets::SecretsCrypto;
+#[cfg(feature = "postgres")]
+use ironclaw::secrets::PostgresSecretsStore;
+#[cfg(feature = "libsql")]
+use ironclaw::secrets::LibSqlSecretsStore;
+#[cfg(feature = "postgres")]
+use ironclaw::setup::{SetupConfig, SetupWizard};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -87,8 +93,6 @@ async fn main() -> anyhow::Result<()> {
             // Memory commands need database (and optionally embeddings)
             let _ = dotenvy::dotenv();
             let config = Config::from_env().await.map_err(|e| anyhow::anyhow!("{}", e))?;
-            let store = ironclaw::history::Store::new(&config.database).await?;
-            store.run_migrations().await?;
 
             // Set up embeddings if available
             let session = ironclaw::llm::create_session_manager(ironclaw::llm::SessionConfig {
@@ -128,7 +132,43 @@ async fn main() -> anyhow::Result<()> {
                     None
                 };
 
-            return run_memory_command(mem_cmd.clone(), store.pool(), embeddings).await;
+            // Create a Database-trait-backed workspace for the memory command
+            let db: Arc<dyn ironclaw::db::Database> = match config.database.backend {
+                #[cfg(feature = "libsql")]
+                ironclaw::config::DatabaseBackend::LibSql => {
+                    use ironclaw::db::libsql_backend::LibSqlBackend;
+                    use ironclaw::db::Database as _;
+                    use secrecy::ExposeSecret as _;
+
+                    let default_path = ironclaw::config::default_libsql_path();
+                    let db_path = config.database.libsql_path.as_deref()
+                        .unwrap_or(&default_path);
+
+                    let backend = if let Some(ref url) = config.database.libsql_url {
+                        let token = config.database.libsql_auth_token.as_ref()
+                            .expect("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set");
+                        LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await?
+                    } else {
+                        LibSqlBackend::new_local(db_path).await?
+                    };
+                    backend.run_migrations().await?;
+                    Arc::new(backend)
+                }
+                #[cfg(feature = "postgres")]
+                _ => {
+                    use ironclaw::db::Database as _;
+                    let pg = ironclaw::db::postgres::PgBackend::new(&config.database).await
+                        .map_err(|e| anyhow::anyhow!("{}", e))?;
+                    pg.run_migrations().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+                    Arc::new(pg)
+                }
+                #[cfg(not(feature = "postgres"))]
+                _ => {
+                    anyhow::bail!("No database backend available. Enable 'postgres' or 'libsql' feature.");
+                }
+            };
+
+            return ironclaw::cli::run_memory_command_with_db(mem_cmd.clone(), db, embeddings).await;
         }
         Some(Command::Pairing(pairing_cmd)) => {
             tracing_subscriber::fmt()
@@ -233,12 +273,20 @@ async fn main() -> anyhow::Result<()> {
             // Load .env before running onboarding wizard
             let _ = dotenvy::dotenv();
 
-            let config = SetupConfig {
-                skip_auth: *skip_auth,
-                channels_only: *channels_only,
-            };
-            let mut wizard = SetupWizard::with_config(config);
-            wizard.run().await?;
+            #[cfg(feature = "postgres")]
+            {
+                let config = SetupConfig {
+                    skip_auth: *skip_auth,
+                    channels_only: *channels_only,
+                };
+                let mut wizard = SetupWizard::with_config(config);
+                wizard.run().await?;
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                let _ = (skip_auth, channels_only);
+                eprintln!("Onboarding wizard requires the 'postgres' feature. Configure settings via environment variables instead.");
+            }
             return Ok(());
         }
         None | Some(Command::Run) => {
@@ -249,7 +297,8 @@ async fn main() -> anyhow::Result<()> {
     // Load .env if present
     let _ = dotenvy::dotenv();
 
-    // Enhanced first-run detection
+    // Enhanced first-run detection (postgres only - libsql uses env vars)
+    #[cfg(feature = "postgres")]
     if !cli.no_onboard {
         if let Some(reason) = check_onboard_needed().await {
             println!("Onboarding needed: {}", reason);
@@ -317,23 +366,72 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Loaded configuration for agent: {}", config.agent.name);
     tracing::info!("LLM backend: {}", config.llm.backend);
 
-    // Initialize database store (optional for testing)
-    let store = if cli.no_db {
+    // Initialize database backend.
+    //
+    // Creates an `Arc<dyn Database>` that all consumers share.
+    // Backend is selected by the `DATABASE_BACKEND` env var / config.
+    #[cfg(feature = "postgres")]
+    let mut pg_pool: Option<deadpool_postgres::Pool> = None;
+    #[cfg(feature = "libsql")]
+    let mut libsql_conn: Option<libsql::Connection> = None;
+
+    let db: Option<Arc<dyn ironclaw::db::Database>> = if cli.no_db {
         tracing::warn!("Running without database connection");
         None
     } else {
-        let store = Store::new(&config.database).await?;
-        store.run_migrations().await?;
-        tracing::info!("Database connected and migrations applied");
+        match config.database.backend {
+            #[cfg(feature = "libsql")]
+            ironclaw::config::DatabaseBackend::LibSql => {
+                use ironclaw::db::libsql_backend::LibSqlBackend;
+                use ironclaw::db::Database as _;
+                use secrecy::ExposeSecret as _;
 
+                let default_path = ironclaw::config::default_libsql_path();
+                let db_path = config.database.libsql_path.as_deref()
+                    .unwrap_or(&default_path);
+
+                let backend = if let Some(ref url) = config.database.libsql_url {
+                    let token = config.database.libsql_auth_token.as_ref()
+                        .expect("LIBSQL_AUTH_TOKEN required when LIBSQL_URL is set");
+                    LibSqlBackend::new_remote_replica(db_path, url, token.expose_secret()).await?
+                } else {
+                    LibSqlBackend::new_local(db_path).await?
+                };
+                backend.run_migrations().await?;
+                tracing::info!("libSQL database connected and migrations applied");
+
+                // Capture an extra connection for SecretsStore / WasmToolStore
+                libsql_conn = Some(backend.connect().map_err(|e| anyhow::anyhow!("{}", e))?);
+
+                Some(Arc::new(backend) as Arc<dyn ironclaw::db::Database>)
+            }
+            #[cfg(feature = "postgres")]
+            _ => {
+                use ironclaw::db::Database as _;
+                let pg = ironclaw::db::postgres::PgBackend::new(&config.database).await
+                    .map_err(|e| anyhow::anyhow!("{}", e))?;
+                pg.run_migrations().await.map_err(|e| anyhow::anyhow!("{}", e))?;
+                tracing::info!("PostgreSQL database connected and migrations applied");
+
+                pg_pool = Some(pg.pool());
+                Some(Arc::new(pg) as Arc<dyn ironclaw::db::Database>)
+            }
+            #[cfg(not(feature = "postgres"))]
+            _ => {
+                anyhow::bail!("No database backend available. Enable 'postgres' or 'libsql' feature.");
+            }
+        }
+    };
+
+    // Post-init operations using the database
+    if let Some(ref db) = db {
         // One-time migration: move disk config files into the DB settings table.
-        if let Err(e) = ironclaw::bootstrap::migrate_disk_to_db(&store, "default").await {
+        if let Err(e) = ironclaw::bootstrap::migrate_disk_to_db(db.as_ref(), "default").await {
             tracing::warn!("Disk-to-DB settings migration failed: {}", e);
         }
 
         // Reload config from DB now that we have a connection.
-        // Priority: env var > DB setting > default.
-        match Config::from_db(&store, "default", &bootstrap).await {
+        match Config::from_db(db.as_ref(), "default", &bootstrap).await {
             Ok(db_config) => {
                 config = db_config;
                 tracing::info!("Configuration reloaded from database");
@@ -346,19 +444,14 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        let store = Arc::new(store);
-
-        // Attach store to session manager so tokens save to DB too
-        session.attach_store(Arc::clone(&store), "default").await;
+        // Attach DB to session manager so tokens save to DB too
+        session.attach_store(Arc::clone(db), "default").await;
 
         // Mark any jobs left in "running" or "creating" state as "interrupted".
-        if let Err(e) = store.cleanup_stale_sandbox_jobs().await {
+        if let Err(e) = db.cleanup_stale_sandbox_jobs().await {
             tracing::warn!("Failed to cleanup stale sandbox jobs: {}", e);
         }
-
-        Some(store)
-    };
-
+    }
     // Initialize LLM provider (clone session so we can reuse it for embeddings)
     let llm = create_llm_provider(&config.llm, session.clone())?;
     tracing::info!("LLM provider initialized: {}", llm.model_name());
@@ -412,8 +505,8 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Register memory tools if database is available
-    if let Some(ref store) = store {
-        let mut workspace = Workspace::new("default", store.pool());
+    if let Some(ref db) = db {
+        let mut workspace = Workspace::new_with_db("default", Arc::clone(db));
         if let Some(ref emb) = embeddings {
             workspace = workspace.with_embeddings(emb.clone());
         }
@@ -437,21 +530,46 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Create secrets store if master key is configured (needed for MCP auth and WASM channels)
-    let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> =
-        if let (Some(store), Some(master_key)) = (&store, config.secrets.master_key()) {
-            match SecretsCrypto::new(master_key.clone()) {
-                Ok(crypto) => Some(Arc::new(PostgresSecretsStore::new(
-                    store.pool(),
-                    Arc::new(crypto),
-                ))),
-                Err(e) => {
-                    tracing::warn!("Failed to initialize secrets crypto: {}", e);
-                    None
+    let secrets_store: Option<Arc<dyn SecretsStore + Send + Sync>> = {
+        #[cfg(feature = "postgres")]
+        {
+            if let (Some(pool), Some(master_key)) = (&pg_pool, config.secrets.master_key()) {
+                match SecretsCrypto::new(master_key.clone()) {
+                    Ok(crypto) => Some(Arc::new(PostgresSecretsStore::new(
+                        pool.clone(),
+                        Arc::new(crypto),
+                    ))),
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize secrets crypto: {}", e);
+                        None
+                    }
                 }
+            } else {
+                None
             }
-        } else {
+        }
+        #[cfg(all(feature = "libsql", not(feature = "postgres")))]
+        {
+            if let (Some(conn), Some(master_key)) = (libsql_conn.take(), config.secrets.master_key()) {
+                match SecretsCrypto::new(master_key.clone()) {
+                    Ok(crypto) => Some(Arc::new(
+                        LibSqlSecretsStore::new(conn, Arc::new(crypto)),
+                    )
+                        as Arc<dyn SecretsStore + Send + Sync>),
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize secrets crypto: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        }
+        #[cfg(not(any(feature = "postgres", feature = "libsql")))]
+        {
             None
-        };
+        }
+    };
 
     let mcp_session_manager = Arc::new(McpSessionManager::new());
 
@@ -513,8 +631,8 @@ async fn main() -> anyhow::Result<()> {
 
     let mcp_servers_future = async {
         if let Some(ref secrets) = secrets_store {
-            let servers_result = if let Some(ref s) = store {
-                load_mcp_servers_from_db(s, "default").await
+            let servers_result = if let Some(ref d) = db {
+                load_mcp_servers_from_db(d.as_ref(), "default").await
             } else {
                 ironclaw::tools::mcp::config::load_mcp_servers().await
             };
@@ -627,7 +745,7 @@ async fn main() -> anyhow::Result<()> {
             config.channels.wasm_channels_dir.clone(),
             config.tunnel.public_url.clone(),
             "default".to_string(),
-            store.clone(),
+            db.clone(),
         ));
         tools.register_extension_tools(Arc::clone(&manager));
         tracing::info!("Extension manager initialized with in-chat discovery tools");
@@ -689,7 +807,7 @@ async fn main() -> anyhow::Result<()> {
             token_store,
             job_event_tx: job_event_tx.clone(),
             prompt_queue: Arc::clone(&prompt_queue),
-            store: store.clone(),
+            store: db.clone(),
         };
 
         tokio::spawn(async move {
@@ -926,13 +1044,15 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Create workspace for agent (shared with memory tools)
-    let workspace = store.as_ref().map(|s| {
-        let mut ws = Workspace::new("default", s.pool());
+    let workspace = if let Some(ref db_ref) = db {
+        let mut ws = Workspace::new_with_db("default", Arc::clone(db_ref));
         if let Some(ref emb) = embeddings {
             ws = ws.with_embeddings(emb.clone());
         }
-        Arc::new(ws)
-    });
+        Some(Arc::new(ws))
+    } else {
+        None
+    };
 
     // Seed workspace with core identity files on first boot
     if let Some(ref ws) = workspace {
@@ -970,7 +1090,7 @@ async fn main() -> anyhow::Result<()> {
     tools.register_job_tools(
         Arc::clone(&context_manager),
         container_job_manager.clone(),
-        store.clone(),
+        db.clone(),
     );
 
     // Add web gateway channel if configured
@@ -985,8 +1105,8 @@ async fn main() -> anyhow::Result<()> {
         if let Some(ref ext_mgr) = extension_manager {
             gw = gw.with_extension_manager(Arc::clone(ext_mgr));
         }
-        if let Some(ref s) = store {
-            gw = gw.with_store(Arc::clone(s));
+        if let Some(ref d) = db {
+            gw = gw.with_store(Arc::clone(d));
         }
         if let Some(ref jm) = container_job_manager {
             gw = gw.with_job_manager(Arc::clone(jm));
@@ -1023,7 +1143,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Create and run the agent
     let deps = AgentDeps {
-        store,
+        store: db,
         llm,
         safety,
         tools,
@@ -1057,6 +1177,7 @@ async fn main() -> anyhow::Result<()> {
 /// Check if onboarding is needed and return the reason.
 ///
 /// Returns `Some(reason)` if onboarding should be triggered, `None` otherwise.
+#[cfg(feature = "postgres")]
 async fn check_onboard_needed() -> Option<&'static str> {
     let bootstrap = ironclaw::bootstrap::BootstrapConfig::load();
 

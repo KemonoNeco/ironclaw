@@ -7,7 +7,7 @@ use tokio::sync::RwLock;
 
 use crate::context::ContextManager;
 use crate::extensions::ExtensionManager;
-use crate::history::Store;
+use crate::db::Database;
 use crate::llm::{LlmProvider, ToolDefinition};
 use crate::orchestrator::job_manager::ContainerJobManager;
 use crate::safety::SafetyLayer;
@@ -192,7 +192,7 @@ impl ToolRegistry {
         &self,
         context_manager: Arc<ContextManager>,
         job_manager: Option<Arc<ContainerJobManager>>,
-        store: Option<Arc<Store>>,
+        store: Option<Arc<dyn Database>>,
     ) {
         let mut create_tool = CreateJobTool::new(Arc::clone(&context_manager));
         if let Some(jm) = job_manager {
@@ -225,7 +225,7 @@ impl ToolRegistry {
     /// of routines (scheduled and event-driven tasks).
     pub fn register_routine_tools(
         &self,
-        store: Arc<Store>,
+        store: Arc<dyn Database>,
         engine: Arc<crate::agent::routine_engine::RoutineEngine>,
     ) {
         use crate::tools::builtin::{

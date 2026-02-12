@@ -20,6 +20,7 @@
 
 mod channels;
 mod prompts;
+#[cfg(feature = "postgres")]
 mod wizard;
 
 pub use channels::{
@@ -29,4 +30,5 @@ pub use prompts::{
     confirm, input, optional_input, print_error, print_header, print_info, print_step,
     print_success, secret_input, select_many, select_one,
 };
+#[cfg(feature = "postgres")]
 pub use wizard::{SetupConfig, SetupWizard};
