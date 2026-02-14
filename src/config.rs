@@ -5,13 +5,22 @@
 //! in startup). Everything else comes from env vars, the DB settings
 //! table, or auto-detection.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::error::ConfigError;
 use crate::settings::Settings;
+
+/// Thread-safe overlay for injected env vars (secrets loaded from DB).
+///
+/// Used by `inject_llm_keys_from_secrets()` to make API keys available to
+/// `optional_env()` without unsafe `set_var` calls. Read by `optional_env()`
+/// before falling back to `std::env::var()`.
+static INJECTED_VARS: OnceLock<HashMap<String, String>> = OnceLock::new();
 
 /// Main configuration for the agent.
 #[derive(Debug, Clone)]
@@ -1358,11 +1367,12 @@ impl ClaudeCodeConfig {
     }
 }
 
-/// Load API keys from the encrypted secrets store into process env vars.
+/// Load API keys from the encrypted secrets store into a thread-safe overlay.
 ///
 /// This bridges the gap between secrets stored during onboarding and the
-/// env-var-first resolution in `LlmConfig::resolve()`. Only sets env vars
-/// that aren't already present, so explicit env vars always win.
+/// env-var-first resolution in `LlmConfig::resolve()`. Keys in the overlay
+/// are read by `optional_env()` before falling back to `std::env::var()`,
+/// so explicit env vars always win.
 pub async fn inject_llm_keys_from_secrets(
     secrets: &dyn crate::secrets::SecretsStore,
     user_id: &str,
@@ -1373,42 +1383,49 @@ pub async fn inject_llm_keys_from_secrets(
         ("llm_compatible_api_key", "LLM_API_KEY"),
     ];
 
+    let mut injected = HashMap::new();
+
     for (secret_name, env_var) in mappings {
         if std::env::var(env_var).is_ok() {
             continue;
         }
         match secrets.get_decrypted(user_id, secret_name).await {
             Ok(decrypted) => {
-                // SAFETY: Called from main() before any tokio::spawn(). The tokio
-                // worker threads exist but are idle (no tasks scheduled yet), so
-                // no concurrent std::env::var reads can race with this write.
-                unsafe {
-                    std::env::set_var(env_var, decrypted.expose());
-                }
-                tracing::debug!(
-                    "Injected secret '{}' into env var '{}'",
-                    secret_name,
-                    env_var
-                );
+                injected.insert(env_var.to_string(), decrypted.expose().to_string());
+                tracing::debug!("Loaded secret '{}' for env var '{}'", secret_name, env_var);
             }
             Err(_) => {
                 // Secret doesn't exist, that's fine
             }
         }
     }
+
+    let _ = INJECTED_VARS.set(injected);
 }
 
 // Helper functions
 
 fn optional_env(key: &str) -> Result<Option<String>, ConfigError> {
+    // Check real env vars first (always win over injected secrets)
     match std::env::var(key) {
-        Ok(val) if val.is_empty() => Ok(None),
-        Ok(val) => Ok(Some(val)),
-        Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(e) => Err(ConfigError::ParseError(format!(
-            "failed to read {key}: {e}"
-        ))),
+        Ok(val) if val.is_empty() => {}
+        Ok(val) => return Ok(Some(val)),
+        Err(std::env::VarError::NotPresent) => {}
+        Err(e) => {
+            return Err(ConfigError::ParseError(format!(
+                "failed to read {key}: {e}"
+            )));
+        }
     }
+
+    // Fall back to thread-safe overlay (secrets injected from DB)
+    if let Some(map) = INJECTED_VARS.get() {
+        if let Some(val) = map.get(key) {
+            return Ok(Some(val.clone()));
+        }
+    }
+
+    Ok(None)
 }
 
 fn parse_optional_env<T>(key: &str, default: T) -> Result<T, ConfigError>

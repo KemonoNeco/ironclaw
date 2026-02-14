@@ -82,6 +82,8 @@ pub struct SetupWizard {
     db_backend: Option<crate::db::libsql_backend::LibSqlBackend>,
     /// Secrets crypto (created during setup).
     secrets_crypto: Option<Arc<SecretsCrypto>>,
+    /// Cached API key from provider setup (used by model fetcher without env mutation).
+    llm_api_key: Option<String>,
 }
 
 impl SetupWizard {
@@ -96,6 +98,7 @@ impl SetupWizard {
             #[cfg(feature = "libsql")]
             db_backend: None,
             secrets_crypto: None,
+            llm_api_key: None,
         }
     }
 
@@ -110,6 +113,7 @@ impl SetupWizard {
             #[cfg(feature = "libsql")]
             db_backend: None,
             secrets_crypto: None,
+            llm_api_key: None,
         }
     }
 
@@ -734,6 +738,14 @@ impl SetupWizard {
         if let Ok(existing) = std::env::var(env_var) {
             print_info(&format!("{env_var} found: {}", mask_api_key(&existing)));
             if confirm("Use this key?", true).map_err(SetupError::Io)? {
+                // Persist env-provided key to secrets store for future runs
+                if let Ok(ctx) = self.init_secrets_context().await {
+                    let key = SecretString::from(existing.clone());
+                    if let Err(e) = ctx.save_secret(secret_name, &key).await {
+                        tracing::warn!("Failed to persist env key to secrets: {}", e);
+                    }
+                }
+                self.llm_api_key = Some(existing);
                 print_success(&format!("{display_name} configured (from env)"));
                 return Ok(());
             }
@@ -762,10 +774,8 @@ impl SetupWizard {
             ));
         }
 
-        // SAFETY: Onboarding runs single-threaded before the async runtime spawns workers.
-        unsafe {
-            std::env::set_var(env_var, key_str);
-        }
+        // Cache key in memory for model fetching later in the wizard
+        self.llm_api_key = Some(key_str.to_string());
 
         print_success(&format!("{display_name} configured"));
         Ok(())
@@ -792,11 +802,6 @@ impl SetupWizard {
 
         let url = url_input.unwrap_or_else(|| default_url.to_string());
         self.settings.ollama_base_url = Some(url.clone());
-
-        // SAFETY: Onboarding runs single-threaded before the async runtime spawns workers.
-        unsafe {
-            std::env::set_var("OLLAMA_BASE_URL", &url);
-        }
 
         print_success(&format!("Ollama configured ({})", url));
         Ok(())
@@ -830,10 +835,6 @@ impl SetupWizard {
         }
 
         self.settings.openai_compatible_base_url = Some(url.clone());
-        // SAFETY: Onboarding runs single-threaded before the async runtime spawns workers.
-        unsafe {
-            std::env::set_var("LLM_BASE_URL", &url);
-        }
 
         // Optional API key
         if confirm("Does this endpoint require an API key?", false).map_err(SetupError::Io)? {
@@ -850,11 +851,6 @@ impl SetupWizard {
                     print_success("API key encrypted and saved");
                 } else {
                     print_info("Secrets not available. Set LLM_API_KEY in your environment.");
-                }
-
-                // SAFETY: Onboarding runs single-threaded before the async runtime spawns workers.
-                unsafe {
-                    std::env::set_var("LLM_API_KEY", key_str);
                 }
             }
         }
@@ -887,11 +883,11 @@ impl SetupWizard {
 
         match backend {
             "anthropic" => {
-                let models = fetch_anthropic_models().await;
+                let models = fetch_anthropic_models(self.llm_api_key.as_deref()).await;
                 self.select_from_model_list(&models)?;
             }
             "openai" => {
-                let models = fetch_openai_models().await;
+                let models = fetch_openai_models(self.llm_api_key.as_deref()).await;
                 self.select_from_model_list(&models)?;
             }
             "ollama" => {
@@ -1619,7 +1615,7 @@ fn mask_password_in_url(url: &str) -> String {
 /// Fetch models from the Anthropic API.
 ///
 /// Returns `(model_id, display_label)` pairs. Falls back to static defaults on error.
-async fn fetch_anthropic_models() -> Vec<(String, String)> {
+async fn fetch_anthropic_models(cached_key: Option<&str>) -> Vec<(String, String)> {
     let static_defaults = vec![
         ("claude-sonnet-4-20250514".into(), "Claude Sonnet 4".into()),
         ("claude-opus-4-20250514".into(), "Claude Opus 4".into()),
@@ -1629,9 +1625,14 @@ async fn fetch_anthropic_models() -> Vec<(String, String)> {
         ),
     ];
 
-    let api_key = match std::env::var("ANTHROPIC_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => return static_defaults,
+    let api_key = cached_key
+        .map(String::from)
+        .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
+        .filter(|k| !k.is_empty());
+
+    let api_key = match api_key {
+        Some(k) => k,
+        None => return static_defaults,
     };
 
     let client = reqwest::Client::new();
@@ -1680,16 +1681,21 @@ async fn fetch_anthropic_models() -> Vec<(String, String)> {
 /// Fetch models from the OpenAI API.
 ///
 /// Returns `(model_id, display_label)` pairs. Falls back to static defaults on error.
-async fn fetch_openai_models() -> Vec<(String, String)> {
+async fn fetch_openai_models(cached_key: Option<&str>) -> Vec<(String, String)> {
     let static_defaults = vec![
         ("gpt-4o".into(), "GPT-4o".into()),
         ("gpt-4o-mini".into(), "GPT-4o Mini (fast)".into()),
         ("o3".into(), "o3 (reasoning)".into()),
     ];
 
-    let api_key = match std::env::var("OPENAI_API_KEY") {
-        Ok(k) if !k.is_empty() => k,
-        _ => return static_defaults,
+    let api_key = cached_key
+        .map(String::from)
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok())
+        .filter(|k| !k.is_empty());
+
+    let api_key = match api_key {
+        Some(k) => k,
+        None => return static_defaults,
     };
 
     let client = reqwest::Client::new();
@@ -2060,7 +2066,7 @@ mod tests {
     async fn test_fetch_anthropic_models_static_fallback() {
         // With no API key, should return static defaults
         let _guard = EnvGuard::clear("ANTHROPIC_API_KEY");
-        let models = fetch_anthropic_models().await;
+        let models = fetch_anthropic_models(None).await;
         assert!(!models.is_empty());
         assert!(
             models.iter().any(|(id, _)| id.contains("claude")),
@@ -2071,7 +2077,7 @@ mod tests {
     #[tokio::test]
     async fn test_fetch_openai_models_static_fallback() {
         let _guard = EnvGuard::clear("OPENAI_API_KEY");
-        let models = fetch_openai_models().await;
+        let models = fetch_openai_models(None).await;
         assert!(!models.is_empty());
         assert!(
             models.iter().any(|(id, _)| id.contains("gpt")),
