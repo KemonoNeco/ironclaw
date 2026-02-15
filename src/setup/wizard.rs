@@ -1505,15 +1505,35 @@ impl SetupWizard {
             }
         }
 
-        // Save DATABASE_URL to ~/.ironclaw/.env (the only field that needs
-        // disk persistence before the DB is available).
-        if let Some(ref url) = self.settings.database_url {
-            crate::bootstrap::save_database_url(url).map_err(|e| {
-                SetupError::Io(std::io::Error::other(format!(
-                    "Failed to save DATABASE_URL to .env: {}",
-                    e
-                )))
-            })?;
+        // Persist database bootstrap vars to ~/.ironclaw/.env.
+        // These are the chicken-and-egg settings: we need them to decide
+        // which database to connect to, so they can't live in the database.
+        {
+            let mut env_vars: Vec<(&str, String)> = Vec::new();
+
+            if let Some(ref backend) = self.settings.database_backend {
+                env_vars.push(("DATABASE_BACKEND", backend.clone()));
+            }
+            if let Some(ref url) = self.settings.database_url {
+                env_vars.push(("DATABASE_URL", url.clone()));
+            }
+            if let Some(ref path) = self.settings.libsql_path {
+                env_vars.push(("LIBSQL_PATH", path.clone()));
+            }
+            if let Some(ref url) = self.settings.libsql_url {
+                env_vars.push(("LIBSQL_URL", url.clone()));
+            }
+
+            if !env_vars.is_empty() {
+                let pairs: Vec<(&str, &str)> =
+                    env_vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                crate::bootstrap::save_bootstrap_env(&pairs).map_err(|e| {
+                    SetupError::Io(std::io::Error::other(format!(
+                        "Failed to save bootstrap env to .env: {}",
+                        e
+                    )))
+                })?;
+            }
         }
 
         println!();
