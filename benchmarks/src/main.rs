@@ -186,6 +186,11 @@ async fn main() -> anyhow::Result<()> {
 
             let llm = ironclaw::llm::create_llm_provider(&ironclaw_config.llm, session)?;
 
+            // Apply --model override to the LLM provider itself
+            if let Some(ref m) = model {
+                llm.set_model(m)?;
+            }
+
             let runner = runner::BenchRunner::new(bench_suite, bench_config.clone(), llm);
 
             // Run for each matrix entry
