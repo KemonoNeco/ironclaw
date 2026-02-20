@@ -116,9 +116,8 @@ classify_contributor() {
 
   # Count merged PRs by this author in this repo
   local count
-  count=$(gh api "/search/issues" \
-    -f q="repo:${REPO} is:pr is:merged author:${author}" \
-    --jq '.total_count')
+  count=$(gh pr list --repo "$REPO" --state merged --author "$author" \
+    --limit 100 --json number --jq 'length')
 
   local label
   if   (( count == 0 )); then label="contributor: new"
