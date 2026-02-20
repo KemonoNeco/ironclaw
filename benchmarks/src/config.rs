@@ -86,14 +86,6 @@ impl BenchConfig {
             _ => toml::map::Map::new(),
         }
     }
-
-    /// Get a string value from suite_config.
-    pub fn suite_config_str(&self, key: &str) -> Option<String> {
-        self.suite_config_map()
-            .get(key)
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    }
 }
 
 fn default_suite_config() -> toml::Value {
@@ -207,8 +199,11 @@ dataset_path = "./data/test.jsonl"
         assert_eq!(config.parallelism, 2);
         assert_eq!(config.matrix.len(), 2);
         assert_eq!(
-            config.suite_config_str("dataset_path").unwrap(),
-            "./data/test.jsonl"
+            config
+                .suite_config_map()
+                .get("dataset_path")
+                .and_then(|v| v.as_str()),
+            Some("./data/test.jsonl")
         );
     }
 }

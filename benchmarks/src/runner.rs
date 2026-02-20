@@ -1,14 +1,21 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
+use ironclaw::agent::cost_guard::{CostGuard, CostGuardConfig};
+use ironclaw::agent::{Agent, AgentDeps};
+use ironclaw::channels::{ChannelManager, IncomingMessage};
+use ironclaw::config::{AgentConfig, SafetyConfig};
+use ironclaw::hooks::HookRegistry;
 use ironclaw::llm::LlmProvider;
+use ironclaw::safety::SafetyLayer;
+use ironclaw::tools::ToolRegistry;
 
-use crate::agentic::AgenticLoop;
+use crate::channel::BenchChannel;
 use crate::config::{BenchConfig, MatrixEntry};
 use crate::error::BenchError;
 use crate::instrumented_llm::InstrumentedLlm;
@@ -24,7 +31,7 @@ struct TaskRunParams {
     suite_id: String,
     config_label: String,
     llm: Arc<dyn LlmProvider>,
-    timeout: std::time::Duration,
+    timeout: Duration,
     max_iterations: usize,
     task_tools: Vec<Arc<dyn ironclaw::tools::Tool>>,
     system_prompt: String,
@@ -35,7 +42,7 @@ const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are an AI assistant completing a benchmark task. \
 Use the provided tools to accomplish the task described in the user message.";
 
-/// Orchestrates benchmark execution: loads tasks, runs the agentic loop per
+/// Orchestrates benchmark execution: loads tasks, runs the real Agent per
 /// task, scores results, writes JSONL output.
 pub struct BenchRunner {
     suite: Arc<dyn BenchSuite>,
@@ -109,8 +116,10 @@ impl BenchRunner {
         // Filter out already-completed tasks
         tasks.retain(|t| !completed.contains(&t.id));
 
-        // Sample if requested
+        // Sample if requested (random shuffle for representative subset)
         if let Some(n) = sample {
+            use rand::seq::SliceRandom;
+            tasks.shuffle(&mut rand::thread_rng());
             tasks.truncate(n);
         }
 
@@ -178,8 +187,10 @@ impl BenchRunner {
                 all_results.lock().await.push(result);
             }
         } else {
-            // Parallel execution with bounded concurrency
+            // Parallel execution with bounded concurrency.
+            // Each task writes its result to JSONL immediately for durability.
             let semaphore = Arc::new(tokio::sync::Semaphore::new(self.config.parallelism));
+            let jsonl_mutex = Arc::new(tokio::sync::Mutex::new(jsonl_path.clone()));
 
             let mut handles = Vec::new();
             for (i, task) in tasks.into_iter().enumerate() {
@@ -193,6 +204,7 @@ impl BenchRunner {
                 let completed_count = completed.len();
                 let total = total_tasks;
                 let sys_prompt = system_prompt.clone();
+                let jsonl_ref = Arc::clone(&jsonl_mutex);
 
                 handles.push(tokio::spawn(async move {
                     let _permit = match sem.acquire().await {
@@ -217,6 +229,12 @@ impl BenchRunner {
                             Utc::now(),
                             &format!("setup_task failed: {e}"),
                         );
+                        {
+                            let path = jsonl_ref.lock().await;
+                            if let Err(e) = append_task_result(&path, &result) {
+                                tracing::error!("Failed to write result for {}: {e}", task.id);
+                            }
+                        }
                         results_ref.lock().await.push(result);
                         return;
                     }
@@ -239,6 +257,12 @@ impl BenchRunner {
                     if let Err(e) = suite.teardown_task(&task).await {
                         tracing::warn!("teardown_task failed for {}: {}", task.id, e);
                     }
+                    {
+                        let path = jsonl_ref.lock().await;
+                        if let Err(e) = append_task_result(&path, &result) {
+                            tracing::error!("Failed to write result for {}: {e}", task.id);
+                        }
+                    }
                     results_ref.lock().await.push(result);
                 }));
             }
@@ -247,13 +271,6 @@ impl BenchRunner {
                 if let Err(e) = handle.await {
                     tracing::error!("Task panicked: {}", e);
                 }
-            }
-
-            // Write all results to JSONL after parallel execution completes.
-            // This avoids the race condition of concurrent file appends.
-            let results = all_results.lock().await;
-            for result in results.iter() {
-                append_task_result(&jsonl_path, result)?;
             }
         }
 
@@ -264,7 +281,6 @@ impl BenchRunner {
             if let Some(task) = task_index.get(&result.task_id) {
                 let submission = TaskSubmission {
                     response: result.response.clone(),
-                    conversation: vec![],
                     tool_calls: result
                         .trace
                         .tool_calls
@@ -337,10 +353,11 @@ fn build_user_prompt(task: &BenchTask) -> String {
     }
 }
 
-/// Run a single benchmark task using the direct agentic loop.
+/// Run a single benchmark task using the real Agent.
 ///
-/// Creates an InstrumentedLlm + AgenticLoop, runs until completion or timeout,
-/// and returns the TaskResult.
+/// Creates a fresh Agent with BenchChannel, InstrumentedLlm, and only the
+/// suite's tools. Sends one message, waits for the response, and extracts
+/// metrics from the capture and instrumented LLM.
 async fn run_task_isolated(params: TaskRunParams) -> TaskResult {
     let TaskRunParams {
         task_id,
@@ -360,28 +377,97 @@ async fn run_task_isolated(params: TaskRunParams) -> TaskResult {
     // Wrap LLM with instrumentation
     let instrumented = Arc::new(InstrumentedLlm::new(llm));
 
-    let agentic = AgenticLoop::new(
-        instrumented.clone() as Arc<dyn LlmProvider>,
-        task_tools,
-        max_iterations,
-    );
+    // Build the BenchChannel
+    let (bench_channel, msg_tx) = BenchChannel::new();
+    let capture = bench_channel.capture();
 
-    let agentic_result =
-        tokio::time::timeout(timeout, agentic.run(&system_prompt, &user_prompt)).await;
+    // Register only suite-specific tools (no builtins)
+    let tools = Arc::new(ToolRegistry::new());
+    for tool in task_tools {
+        tools.register_sync(tool);
+    }
 
+    // Prepend system prompt to user message. The real agent loads its system
+    // prompt from workspace identity files, which benchmarks don't have.
+    // Combining them into the user message achieves the same effect.
+    let full_prompt = format!("{system_prompt}\n\n{user_prompt}");
+
+    // Send the message before starting the agent. The mpsc channel buffers
+    // it so the agent picks it up once it starts listening.
+    let message = IncomingMessage::new("bench", "bench-user", &full_prompt);
+    if msg_tx.send(message).await.is_err() {
+        return make_error_result_raw(
+            &task_id,
+            &suite_id,
+            &config_label,
+            started_at,
+            "failed to send message to bench channel",
+        );
+    }
+    // Drop sender so the agent shuts down after processing the one message.
+    // When the stream returns None the agent's run loop breaks cleanly.
+    drop(msg_tx);
+
+    // Wire up the channel manager
+    let mut channels = ChannelManager::new();
+    channels.add(Box::new(bench_channel));
+
+    // Minimal safety layer (trusted benchmark prompts, no injection filtering)
+    let safety = Arc::new(SafetyLayer::new(&SafetyConfig {
+        max_output_length: 500_000,
+        injection_check_enabled: false,
+    }));
+
+    let deps = AgentDeps {
+        store: None,
+        llm: instrumented.clone() as Arc<dyn LlmProvider>,
+        cheap_llm: None,
+        safety,
+        tools,
+        workspace: None,
+        extension_manager: None,
+        hooks: Arc::new(HookRegistry::new()),
+        cost_guard: Arc::new(CostGuard::new(CostGuardConfig::default())),
+    };
+
+    let agent_config = AgentConfig {
+        name: "bench".to_string(),
+        max_parallel_jobs: 1,
+        job_timeout: timeout,
+        stuck_threshold: Duration::from_secs(9999),
+        repair_check_interval: Duration::from_secs(9999),
+        max_repair_attempts: 0,
+        use_planning: false,
+        session_idle_timeout: Duration::from_secs(86400),
+        allow_local_tools: true,
+        max_cost_per_day_cents: None,
+        max_actions_per_hour: None,
+        max_tool_iterations: max_iterations,
+        auto_approve_tools: true,
+    };
+
+    let agent = Agent::new(agent_config, deps, channels, None, None, None, None);
+
+    // Run the agent with a timeout. It processes the buffered message,
+    // then sees the closed stream and shuts down.
+    let agent_result = tokio::time::timeout(timeout, agent.run()).await;
     let wall_time = start.elapsed();
 
-    match agentic_result {
-        Ok(Ok(result)) => {
+    // Extract results from the capture
+    let cap = capture.lock().await;
+
+    match agent_result {
+        Ok(Ok(())) => {
+            let response = cap.responses.last().cloned().unwrap_or_default();
             let trace = Trace {
                 wall_time_ms: wall_time.as_millis() as u64,
                 llm_calls: instrumented.call_count(),
                 input_tokens: instrumented.total_input_tokens(),
                 output_tokens: instrumented.total_output_tokens(),
                 estimated_cost_usd: instrumented.estimated_cost(),
-                tool_calls: result.tool_calls,
-                turns: result.iterations as u32,
-                hit_iteration_limit: result.hit_iteration_limit,
+                tool_calls: cap.tool_calls.clone(),
+                turns: instrumented.call_count(),
+                hit_iteration_limit: false,
                 hit_timeout: false,
             };
 
@@ -394,7 +480,7 @@ async fn run_task_isolated(params: TaskRunParams) -> TaskResult {
                     details: None,
                 },
                 trace,
-                response: result.response,
+                response,
                 started_at,
                 finished_at: Utc::now(),
                 config_label,
@@ -402,7 +488,7 @@ async fn run_task_isolated(params: TaskRunParams) -> TaskResult {
             }
         }
         Ok(Err(e)) => {
-            tracing::warn!("Agentic loop error for task {task_id}: {e}");
+            tracing::warn!("Agent error for task {task_id}: {e}");
             make_error_result_raw(
                 &task_id,
                 &suite_id,
@@ -419,8 +505,8 @@ async fn run_task_isolated(params: TaskRunParams) -> TaskResult {
                 input_tokens: instrumented.total_input_tokens(),
                 output_tokens: instrumented.total_output_tokens(),
                 estimated_cost_usd: instrumented.estimated_cost(),
-                tool_calls: vec![],
-                turns: 0,
+                tool_calls: cap.tool_calls.clone(),
+                turns: instrumented.call_count(),
                 hit_iteration_limit: false,
                 hit_timeout: true,
             };
@@ -433,7 +519,7 @@ async fn run_task_isolated(params: TaskRunParams) -> TaskResult {
                     details: None,
                 },
                 trace,
-                response: String::new(),
+                response: cap.responses.last().cloned().unwrap_or_default(),
                 started_at,
                 finished_at: Utc::now(),
                 config_label,

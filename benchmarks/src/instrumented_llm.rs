@@ -9,12 +9,13 @@ use tokio::sync::Mutex;
 
 use ironclaw::error::LlmError;
 use ironclaw::llm::{
-    CompletionRequest, CompletionResponse, LlmProvider, ToolCompletionRequest,
+    CompletionRequest, CompletionResponse, LlmProvider, ModelMetadata, ToolCompletionRequest,
     ToolCompletionResponse,
 };
 
 /// Recorded metrics from a single LLM call.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct LlmCallRecord {
     pub input_tokens: u32,
     pub output_tokens: u32,
@@ -46,6 +47,7 @@ impl InstrumentedLlm {
     }
 
     /// Take all recorded call metrics, clearing the internal buffer.
+    #[cfg(test)]
     pub async fn take_records(&self) -> Vec<LlmCallRecord> {
         let mut records = self.records.lock().await;
         std::mem::take(&mut *records)
@@ -76,6 +78,7 @@ impl InstrumentedLlm {
     }
 
     /// Reset all counters and records.
+    #[cfg(test)]
     pub async fn reset(&self) {
         self.records.lock().await.clear();
         self.total_input_tokens.store(0, Ordering::Relaxed);
@@ -148,6 +151,30 @@ impl LlmProvider for InstrumentedLlm {
 
     async fn list_models(&self) -> Result<Vec<String>, LlmError> {
         self.inner.list_models().await
+    }
+
+    async fn model_metadata(&self) -> Result<ModelMetadata, LlmError> {
+        self.inner.model_metadata().await
+    }
+
+    fn active_model_name(&self) -> String {
+        self.inner.active_model_name()
+    }
+
+    fn set_model(&self, model: &str) -> Result<(), LlmError> {
+        self.inner.set_model(model)
+    }
+
+    fn seed_response_chain(&self, thread_id: &str, response_id: String) {
+        self.inner.seed_response_chain(thread_id, response_id)
+    }
+
+    fn get_response_chain_id(&self, thread_id: &str) -> Option<String> {
+        self.inner.get_response_chain_id(thread_id)
+    }
+
+    fn calculate_cost(&self, input_tokens: u32, output_tokens: u32) -> Decimal {
+        self.inner.calculate_cost(input_tokens, output_tokens)
     }
 }
 

@@ -195,10 +195,6 @@ impl SpotSuite {
 
 #[async_trait]
 impl BenchSuite for SpotSuite {
-    fn name(&self) -> &str {
-        "Spot Checks"
-    }
-
     fn id(&self) -> &str {
         "spot"
     }
@@ -290,7 +286,6 @@ mod tests {
     ) -> TaskSubmission {
         TaskSubmission {
             response: response.to_string(),
-            conversation: vec![],
             tool_calls: tool_calls.into_iter().map(|s| s.to_string()).collect(),
             error: error.map(|s| s.to_string()),
         }

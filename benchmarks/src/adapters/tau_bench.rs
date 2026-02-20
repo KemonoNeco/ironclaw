@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 
 use crate::error::BenchError;
-use crate::suite::{BenchScore, BenchSuite, BenchTask, ConversationTurn, TaskSubmission};
+use crate::suite::{BenchScore, BenchSuite, BenchTask, TaskSubmission};
 
 /// Tau-bench task entry.
 #[derive(Debug, Deserialize)]
@@ -44,10 +44,6 @@ impl TauBenchSuite {
 
 #[async_trait]
 impl BenchSuite for TauBenchSuite {
-    fn name(&self) -> &str {
-        "Tau-bench"
-    }
-
     fn id(&self) -> &str {
         "tau_bench"
     }
@@ -145,32 +141,6 @@ impl BenchSuite for TauBenchSuite {
             )))
         }
     }
-
-    async fn next_user_message(
-        &self,
-        task: &BenchTask,
-        conversation: &[ConversationTurn],
-    ) -> Result<Option<String>, BenchError> {
-        // Check if we've exceeded max turns
-        if let Some(max) = task.expected_turns {
-            let user_turns = conversation
-                .iter()
-                .filter(|t| matches!(t.role, crate::suite::TurnRole::User))
-                .count();
-            if user_turns >= max {
-                return Ok(None);
-            }
-        }
-
-        // Multi-turn simulation requires an LLM to play the customer role.
-        // Until that's implemented, every scenario is single-turn only.
-        // TODO: Use LLM to simulate customer based on user_persona.
-        tracing::warn!(
-            task_id = %task.id,
-            "multi-turn simulation not implemented, ending after first turn"
-        );
-        Ok(None)
-    }
 }
 
 #[cfg(test)]
@@ -212,7 +182,7 @@ mod tests {
         // Partial completion
         let submission = TaskSubmission {
             response: "I found your order.".to_string(),
-            conversation: vec![],
+
             tool_calls: vec!["lookup_order".to_string()],
             error: None,
         };
@@ -223,7 +193,7 @@ mod tests {
         // Full completion
         let submission = TaskSubmission {
             response: "Return processed.".to_string(),
-            conversation: vec![],
+
             tool_calls: vec!["lookup_order".to_string(), "process_return".to_string()],
             error: None,
         };

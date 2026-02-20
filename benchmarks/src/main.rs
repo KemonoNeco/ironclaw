@@ -1,5 +1,4 @@
 mod adapters;
-mod agentic;
 mod channel;
 mod config;
 mod error;

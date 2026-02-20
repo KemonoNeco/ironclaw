@@ -24,8 +24,9 @@ fn is_safe_path_component(s: &str) -> bool {
 
 /// Validate that a repo string matches the expected `owner/repo` GitHub format.
 fn is_valid_github_repo(repo: &str) -> bool {
-    static REPO_PATTERN: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$").unwrap());
+    static REPO_PATTERN: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$").expect("known-good regex pattern")
+    });
     REPO_PATTERN.is_match(repo)
 }
 
@@ -176,8 +177,9 @@ fn extract_test_ids(task: &BenchTask) -> (Vec<String>, Vec<String>) {
 
 /// Parse `+++ b/path` headers from a unified diff to find test files.
 fn extract_test_files_from_patch(patch: &str) -> Vec<String> {
-    static DIFF_PATH: std::sync::LazyLock<Regex> =
-        std::sync::LazyLock::new(|| Regex::new(r"^\+\+\+ b/(.+)$").unwrap());
+    static DIFF_PATH: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+        Regex::new(r"^\+\+\+ b/(.+)$").expect("known-good regex pattern")
+    });
 
     let mut files = Vec::new();
     for line in patch.lines() {
@@ -282,7 +284,12 @@ fn truncate_output(stdout: &str, stderr: &str, max_len: usize) -> String {
     if max_len == 0 {
         return "... (truncated)".to_string();
     }
-    let truncated = &combined[combined.len().saturating_sub(max_len)..];
+    let start = combined.len().saturating_sub(max_len);
+    // Walk forward to a valid UTF-8 char boundary
+    let start = (start..combined.len())
+        .find(|&i| combined.is_char_boundary(i))
+        .unwrap_or(combined.len());
+    let truncated = &combined[start..];
     if let Some(pos) = truncated.find('\n') {
         format!("... (truncated)\n{}", &truncated[pos + 1..])
     } else {
@@ -875,10 +882,6 @@ async fn run_tests(task_dir: &Path, test_cmd: &str) -> TestRunResult {
 
 #[async_trait]
 impl BenchSuite for SweBenchSuite {
-    fn name(&self) -> &str {
-        "SWE-bench Pro"
-    }
-
     fn id(&self) -> &str {
         "swe_bench"
     }
@@ -999,13 +1002,7 @@ impl BenchSuite for SweBenchSuite {
         if !task_dir.exists() {
             let repo_url = format!("https://github.com/{}.git", repo);
             let output = tokio::process::Command::new("git")
-                .args([
-                    "clone",
-                    "--depth",
-                    "1",
-                    &repo_url,
-                    &task_dir.to_string_lossy(),
-                ])
+                .args(["clone", &repo_url, &task_dir.to_string_lossy()])
                 .output()
                 .await
                 .map_err(|e| BenchError::TaskFailed {
@@ -1034,30 +1031,11 @@ impl BenchSuite for SweBenchSuite {
             })?;
 
         if !output.status.success() {
-            // Shallow clone might not have the commit; fetch more history
-            let _ = tokio::process::Command::new("git")
-                .args(["fetch", "--unshallow"])
-                .current_dir(&task_dir)
-                .output()
-                .await;
-
-            let output = tokio::process::Command::new("git")
-                .args(["checkout", base_commit])
-                .current_dir(&task_dir)
-                .output()
-                .await
-                .map_err(|e| BenchError::TaskFailed {
-                    task_id: task.id.clone(),
-                    reason: format!("git checkout retry failed: {e}"),
-                })?;
-
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(BenchError::TaskFailed {
-                    task_id: task.id.clone(),
-                    reason: format!("git checkout failed: {stderr}"),
-                });
-            }
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(BenchError::TaskFailed {
+                task_id: task.id.clone(),
+                reason: format!("git checkout failed: {stderr}"),
+            });
         }
 
         // Build Docker image if configured (cached by tag, skips if already built)
@@ -1382,7 +1360,7 @@ mod tests {
 
         let submission = TaskSubmission {
             response: String::new(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };
@@ -1420,7 +1398,7 @@ mod tests {
 
         let submission = TaskSubmission {
             response: "I made changes".to_string(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };
@@ -1458,7 +1436,7 @@ mod tests {
 
         let submission = TaskSubmission {
             response: "fixed it".to_string(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };
@@ -1807,6 +1785,17 @@ diff --git a/tests/test_bar.py b/tests/test_bar.py
     fn test_truncate_output_zero_max() {
         let result = truncate_output("stuff", "more stuff", 0);
         assert_eq!(result, "... (truncated)");
+    }
+
+    #[test]
+    fn test_truncate_output_multibyte_utf8() {
+        // Each emoji is 4 bytes. Build stdout with multi-byte chars to ensure
+        // we don't panic when the byte cut falls mid-character.
+        let emoji_line = "🦀".repeat(100); // 400 bytes of 4-byte chars
+        let result = truncate_output(&emoji_line, "err", 50);
+        assert!(result.contains("truncated"));
+        // Must be valid UTF-8 (the fact that we got here without panicking is the test)
+        assert!(result.is_char_boundary(0));
     }
 
     // ── Integration test: teardown captures diff ────────────────────────
@@ -2163,7 +2152,7 @@ index 1234567..abcdefg 100644
         // Score with Docker
         let submission = TaskSubmission {
             response: String::new(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };

@@ -45,5 +45,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Scoring
 regex = "1"
 
-[dev-dependencies]
+# Sampling
+rand = "0.8"
+
+# Docker staging directories
 tempfile = "3"

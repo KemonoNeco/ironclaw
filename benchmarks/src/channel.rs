@@ -8,7 +8,6 @@ use ironclaw::channels::{Channel, IncomingMessage, MessageStream, OutgoingRespon
 use ironclaw::error::ChannelError;
 
 use crate::results::TraceToolCall;
-use crate::suite::ConversationTurn;
 
 /// Truncate a string to at most `max_bytes` without splitting a UTF-8 character.
 fn truncate_str(s: &str, max_bytes: usize) -> &str {
@@ -29,8 +28,6 @@ pub struct ChannelCapture {
     pub responses: Vec<String>,
     /// Tool calls observed (name, success, duration_ms).
     pub tool_calls: Vec<TraceToolCall>,
-    /// Full conversation turns for multi-turn scoring.
-    pub conversation: Vec<ConversationTurn>,
     /// Status messages (for debugging).
     pub status_log: Vec<String>,
 }
@@ -64,11 +61,6 @@ impl BenchChannel {
     pub fn capture(&self) -> Arc<Mutex<ChannelCapture>> {
         Arc::clone(&self.capture)
     }
-
-    /// Get a clone of the message sender for injecting follow-up messages.
-    pub fn sender(&self) -> mpsc::Sender<IncomingMessage> {
-        self.msg_tx.clone()
-    }
 }
 
 #[async_trait]
@@ -96,11 +88,7 @@ impl Channel for BenchChannel {
         response: OutgoingResponse,
     ) -> Result<(), ChannelError> {
         let mut cap = self.capture.lock().await;
-        cap.responses.push(response.content.clone());
-        cap.conversation.push(ConversationTurn {
-            role: crate::suite::TurnRole::Assistant,
-            content: response.content,
-        });
+        cap.responses.push(response.content);
         Ok(())
     }
 
@@ -213,7 +201,6 @@ mod tests {
         let cap = capture.lock().await;
         assert_eq!(cap.responses.len(), 1);
         assert_eq!(cap.responses[0], "world");
-        assert_eq!(cap.conversation.len(), 1);
     }
 
     #[tokio::test]

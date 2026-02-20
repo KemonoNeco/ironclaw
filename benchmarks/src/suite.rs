@@ -46,24 +46,8 @@ pub enum ResourceType {
 #[derive(Debug, Clone)]
 pub struct TaskSubmission {
     pub response: String,
-    pub conversation: Vec<ConversationTurn>,
     pub tool_calls: Vec<String>,
     pub error: Option<String>,
-}
-
-/// A single turn in a multi-turn conversation.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ConversationTurn {
-    pub role: TurnRole,
-    pub content: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum TurnRole {
-    User,
-    Assistant,
-    System,
 }
 
 /// Score for a single task.
@@ -109,9 +93,6 @@ impl BenchScore {
 /// to provide task loading, scoring, and optional lifecycle hooks.
 #[async_trait]
 pub trait BenchSuite: Send + Sync {
-    /// Human-readable name (e.g., "GAIA Validation").
-    fn name(&self) -> &str;
-
     /// Machine ID (e.g., "gaia").
     fn id(&self) -> &str;
 
@@ -154,15 +135,5 @@ pub trait BenchSuite: Send + Sync {
     /// uses a generic system prompt).
     fn system_prompt(&self) -> Option<String> {
         None
-    }
-
-    /// Multi-turn: generate next simulated user message based on conversation so far.
-    /// Return `None` to end the conversation.
-    async fn next_user_message(
-        &self,
-        _task: &BenchTask,
-        _conversation: &[ConversationTurn],
-    ) -> Result<Option<String>, BenchError> {
-        Ok(None)
     }
 }

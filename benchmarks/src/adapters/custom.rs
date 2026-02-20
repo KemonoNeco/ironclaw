@@ -50,10 +50,6 @@ impl CustomSuite {
 
 #[async_trait]
 impl BenchSuite for CustomSuite {
-    fn name(&self) -> &str {
-        "Custom JSONL"
-    }
-
     fn id(&self) -> &str {
         "custom"
     }
@@ -152,9 +148,9 @@ impl BenchSuite for CustomSuite {
                 // TODO: LLM-as-judge scoring
                 tracing::warn!(
                     task_id = %task.id,
-                    "LLM-as-judge scoring not implemented, returning placeholder 0.5"
+                    "LLM-as-judge scoring not implemented"
                 );
-                Ok(BenchScore::partial(0.5, "LLM scoring not yet implemented"))
+                Ok(BenchScore::fail("LLM-as-judge scoring not yet implemented"))
             }
             other => Err(BenchError::Scoring {
                 task_id: task.id.clone(),
@@ -208,7 +204,7 @@ mod tests {
 
         let submission = TaskSubmission {
             response: "4".to_string(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };
@@ -233,7 +229,7 @@ mod tests {
 
         let submission = TaskSubmission {
             response: "Hello there!".to_string(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };

@@ -20,8 +20,6 @@ struct GaiaEntry {
     level: Option<u32>,
     #[serde(alias = "file_name", default)]
     file_name: Option<String>,
-    #[serde(alias = "Annotator Metadata", default)]
-    annotator_metadata: Option<serde_json::Value>,
 }
 
 /// GAIA benchmark suite.
@@ -47,10 +45,6 @@ impl GaiaSuite {
 
 #[async_trait]
 impl BenchSuite for GaiaSuite {
-    fn name(&self) -> &str {
-        "GAIA"
-    }
-
     fn id(&self) -> &str {
         "gaia"
     }
@@ -165,7 +159,7 @@ mod tests {
         // Exact match (case insensitive)
         let submission = TaskSubmission {
             response: "paris".to_string(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };
@@ -175,7 +169,7 @@ mod tests {
         // Wrong answer
         let submission = TaskSubmission {
             response: "London".to_string(),
-            conversation: vec![],
+
             tool_calls: vec![],
             error: None,
         };
