@@ -68,16 +68,16 @@ impl Agent {
         // Create a JobContext for tool execution (chat doesn't have a real job)
         let job_ctx = JobContext::with_user(&message.user_id, "chat", "Interactive chat session");
 
-        const MAX_TOOL_ITERATIONS: usize = 10;
+        let max_iterations = self.config.max_tool_iterations;
         let mut iteration = 0;
         let mut tools_executed = resume_after_tool;
 
         loop {
             iteration += 1;
-            if iteration > MAX_TOOL_ITERATIONS {
+            if iteration > max_iterations {
                 return Err(crate::error::LlmError::InvalidResponse {
                     provider: "agent".to_string(),
-                    reason: format!("Exceeded maximum tool iterations ({})", MAX_TOOL_ITERATIONS),
+                    reason: format!("Exceeded maximum tool iterations ({max_iterations})"),
                 }
                 .into());
             }
@@ -197,8 +197,9 @@ impl Agent {
 
                     // Execute each tool (with approval checking and hook interception)
                     for mut tc in tool_calls {
-                        // Check if tool requires approval
-                        if let Some(tool) = self.tools().get(&tc.name).await
+                        // Check if tool requires approval (skipped when auto_approve_tools is set)
+                        if !self.config.auto_approve_tools
+                            && let Some(tool) = self.tools().get(&tc.name).await
                             && tool.requires_approval()
                         {
                             // Check if auto-approved for this session
