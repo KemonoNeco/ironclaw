@@ -338,24 +338,44 @@ heartbeat.enabled = "true"
 heartbeat.interval_secs = "300"
 ```
 
+### Incremental Persistence
+
+Settings are persisted **after every successful step**, not just at the end.
+This prevents data loss if a later step fails (e.g., the user enters an
+API key in step 3 but step 5 crashes — they won't need to re-enter it).
+
+**`persist_after_step()`** is called after each step in `run()` and:
+1. Writes bootstrap vars to `~/.ironclaw/.env` via `write_bootstrap_env()`
+2. Writes all current settings to the database via `persist_settings()`
+3. Silently ignores errors (e.g., if called before Step 1 establishes a DB)
+
+**`try_load_existing_settings()`** is called after Step 1 establishes a
+database connection. It loads any previously saved settings from the
+database using `get_all_settings("default")` → `Settings::from_db_map()`
+→ `merge_from()`. This recovers progress from prior partial wizard runs.
+
 ### save_and_summarize()
 
 Final step of the wizard:
 
 ```
 1. Mark onboard_completed = true
-2. Write ALL settings to database (try postgres pool, then libSQL backend)
-3. Write bootstrap vars to ~/.ironclaw/.env:
-   - DATABASE_BACKEND   (always)
-   - DATABASE_URL       (if postgres)
-   - LIBSQL_PATH        (if libsql)
-   - LIBSQL_URL         (if turso sync)
-   - LLM_BACKEND        (always, when set)
-   - LLM_BASE_URL       (if openai_compatible)
-   - OLLAMA_BASE_URL    (if ollama)
-   - ONBOARD_COMPLETED  (always, "true")
+2. Call persist_settings() for final write (idempotent — ensures
+   onboard_completed flag is saved)
+3. Call write_bootstrap_env() for final .env write (idempotent)
 4. Print configuration summary
 ```
+
+Bootstrap vars written to `~/.ironclaw/.env`:
+- `DATABASE_BACKEND` (always)
+- `DATABASE_URL` (if postgres)
+- `LIBSQL_PATH` (if libsql)
+- `LIBSQL_URL` (if turso sync)
+- `LLM_BACKEND` (always, when set)
+- `LLM_BASE_URL` (if openai_compatible)
+- `OLLAMA_BASE_URL` (if ollama)
+- `NEARAI_API_KEY` (if API key auth path)
+- `ONBOARD_COMPLETED` (always, "true")
 
 **Invariant:** Both Layer 1 and Layer 2 must be written. If the database
 write fails, the wizard returns an error and the `.env` file is not written.
@@ -464,9 +484,9 @@ anthropic_api_key     → encrypted API key
 | `confirm(label, default)` | `[Y/n]` or `[y/N]` prompt |
 | `print_header(text)` | Bold section header with underline |
 | `print_step(n, total, text)` | `[1/7] Step Name` |
-| `print_success(text)` | Green checkmark prefix |
-| `print_error(text)` | Red X prefix |
-| `print_info(text)` | Blue info prefix |
+| `print_success(text)` | Green `✓` prefix (ANSI color), message in default color |
+| `print_error(text)` | Red `✗` prefix (ANSI color), message in default color |
+| `print_info(text)` | Blue `ℹ` prefix (ANSI color), message in default color |
 
 `select_many` uses `crossterm` raw mode for arrow key navigation.
 Must properly restore terminal state on all exit paths.
@@ -488,6 +508,28 @@ Must properly restore terminal state on all exit paths.
 - Uses GNOME Keyring or KWallet via `secret-service` crate
 - May need `gnome-keyring` daemon running
 - Collection unlock may prompt for password
+
+### Remote Server Authentication
+
+On remote/VPS servers, the browser-based OAuth flow for NEAR AI may not
+work because `http://127.0.0.1:9876` is unreachable from the user's
+local browser.
+
+**Solutions:**
+
+1. **Manual token paste (option 4 in auth menu):** The user logs into
+   NEAR AI via their local browser, copies the session token, and pastes
+   it into the terminal. No local listener is needed.
+
+2. **Custom callback URL:** Set `IRONCLAW_OAUTH_CALLBACK_URL` to a
+   publicly accessible URL (e.g., via SSH tunnel or reverse proxy) that
+   forwards to port 9876 on the server:
+   ```bash
+   export IRONCLAW_OAUTH_CALLBACK_URL=https://myserver.example.com:9876
+   ```
+
+The `callback_url()` function in `oauth_defaults.rs` checks this env var
+and falls back to `http://127.0.0.1:{OAUTH_CALLBACK_PORT}`.
 
 ### URL Passwords
 

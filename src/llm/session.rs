@@ -217,25 +217,29 @@ impl SessionManager {
         self.initiate_login().await
     }
 
-    /// Start the OAuth login flow.
+    /// Start the login flow.
     ///
-    /// 1. Bind the fixed callback port
+    /// Shows the auth method menu FIRST (before binding any listener), so
+    /// that the manual-token path can skip network binding entirely. This
+    /// is important for remote/headless servers where `127.0.0.1` is
+    /// unreachable from the user's browser.
+    ///
+    /// For OAuth paths (GitHub, Google):
+    /// 1. Bind the callback listener
     /// 2. Print the auth URL and attempt to open browser
     /// 3. Wait for OAuth callback with session token
     /// 4. Save and return the token
+    ///
+    /// For manual token paste:
+    /// 1. Prompt user to paste session token from NEAR AI web
+    /// 2. Validate via /v1/users/me
+    /// 3. Save and return the token
     async fn initiate_login(&self) -> Result<(), LlmError> {
-        use crate::cli::oauth_defaults::{self, OAUTH_CALLBACK_PORT};
+        use crate::cli::oauth_defaults;
 
-        let listener = oauth_defaults::bind_callback_listener()
-            .await
-            .map_err(|e| LlmError::SessionRenewalFailed {
-                provider: "nearai".to_string(),
-                reason: e.to_string(),
-            })?;
+        let cb_url = oauth_defaults::callback_url();
 
-        let callback_url = format!("http://127.0.0.1:{}", OAUTH_CALLBACK_PORT);
-
-        // Show auth provider menu
+        // Show auth provider menu BEFORE binding the listener
         println!();
         println!("╔════════════════════════════════════════════════════════════════╗");
         println!("║                    NEAR AI Authentication                      ║");
@@ -245,10 +249,11 @@ impl SessionManager {
         println!("║    [1] GitHub                                                  ║");
         println!("║    [2] Google                                                  ║");
         println!("║    [3] NEAR Wallet (coming soon)                               ║");
+        println!("║    [4] Paste session token (remote/headless servers)            ║");
         println!("║                                                                ║");
         println!("╚════════════════════════════════════════════════════════════════╝");
         println!();
-        print!("Enter choice [1-3]: ");
+        print!("Enter choice [1-4]: ");
 
         // Flush stdout to ensure prompt is displayed
         use std::io::Write;
@@ -263,23 +268,8 @@ impl SessionManager {
                 reason: format!("Failed to read input: {}", e),
             })?;
 
-        let (auth_provider, auth_url) = match choice.trim() {
-            "1" | "" => {
-                let url = format!(
-                    "{}/v1/auth/github?frontend_callback={}",
-                    self.config.auth_base_url,
-                    urlencoding::encode(&callback_url)
-                );
-                ("github", url)
-            }
-            "2" => {
-                let url = format!(
-                    "{}/v1/auth/google?frontend_callback={}",
-                    self.config.auth_base_url,
-                    urlencoding::encode(&callback_url)
-                );
-                ("google", url)
-            }
+        match choice.trim() {
+            "4" => return self.manual_token_login().await,
             "3" => {
                 println!();
                 println!("NEAR Wallet authentication is not yet implemented.");
@@ -289,11 +279,40 @@ impl SessionManager {
                     reason: "NEAR Wallet auth not yet implemented".to_string(),
                 });
             }
-            _ => {
+            "1" | "" | "2" => {} // handled below after listener bind
+            other => {
                 return Err(LlmError::SessionRenewalFailed {
                     provider: "nearai".to_string(),
-                    reason: format!("Invalid choice: {}", choice.trim()),
+                    reason: format!("Invalid choice: {}", other),
                 });
+            }
+        }
+
+        // OAuth paths: bind the callback listener now
+        let listener = oauth_defaults::bind_callback_listener()
+            .await
+            .map_err(|e| LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: e.to_string(),
+            })?;
+
+        let (auth_provider, auth_url) = match choice.trim() {
+            "2" => {
+                let url = format!(
+                    "{}/v1/auth/google?frontend_callback={}",
+                    self.config.auth_base_url,
+                    urlencoding::encode(&cb_url)
+                );
+                ("google", url)
+            }
+            _ => {
+                // "1" or "" (default)
+                let url = format!(
+                    "{}/v1/auth/github?frontend_callback={}",
+                    self.config.auth_base_url,
+                    urlencoding::encode(&cb_url)
+                );
+                ("github", url)
             }
         };
 
@@ -332,6 +351,80 @@ impl SessionManager {
         {
             let mut guard = self.token.write().await;
             *guard = Some(SecretString::from(session_token));
+        }
+
+        println!();
+        println!("✓ Authentication successful!");
+        println!();
+
+        Ok(())
+    }
+
+    /// Manual token paste flow for remote/headless servers.
+    ///
+    /// Prompts the user to log into NEAR AI via their browser, copy the
+    /// session token, and paste it here. No local listener is needed.
+    async fn manual_token_login(&self) -> Result<(), LlmError> {
+        println!();
+        println!("Manual session token entry");
+        println!("─────────────────────────");
+        println!();
+        println!("  1. Open https://app.near.ai in your browser");
+        println!("  2. Log in with GitHub or Google");
+        println!("  3. Go to Settings → API Keys (or generate a session token)");
+        println!("  4. Copy the session token (starts with 'sess_')");
+        println!();
+        print!("Paste session token: ");
+
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let mut token_input = String::new();
+        std::io::stdin().read_line(&mut token_input).map_err(|e| {
+            LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: format!("Failed to read input: {}", e),
+            }
+        })?;
+
+        let token = token_input.trim().to_string();
+        if token.is_empty() {
+            return Err(LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: "Session token cannot be empty".to_string(),
+            });
+        }
+
+        // Validate the token immediately
+        println!("Validating token...");
+        let url = format!("{}/v1/users/me", self.config.auth_base_url);
+        let response = self
+            .client
+            .get(&url)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .map_err(|e| LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: format!("Validation request failed: {}", e),
+            })?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(LlmError::SessionRenewalFailed {
+                provider: "nearai".to_string(),
+                reason: format!("Token validation failed: HTTP {}: {}", status, body),
+            });
+        }
+
+        // Save the token
+        self.save_session(&token, Some("manual")).await?;
+
+        // Update in-memory token
+        {
+            let mut guard = self.token.write().await;
+            *guard = Some(SecretString::from(token));
         }
 
         println!();

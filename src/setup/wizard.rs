@@ -124,6 +124,11 @@ impl SetupWizard {
     }
 
     /// Run the setup wizard.
+    ///
+    /// Settings are persisted incrementally after each successful step so
+    /// that progress is not lost if a later step fails. On re-run, existing
+    /// settings are loaded from the database after Step 1 establishes a
+    /// connection, so users don't have to re-enter everything.
     pub async fn run(&mut self) -> Result<(), SetupError> {
         print_header("IronClaw Setup Wizard");
 
@@ -137,10 +142,16 @@ impl SetupWizard {
             // Step 1: Database
             print_step(1, total_steps, "Database Connection");
             self.step_database().await?;
+            self.persist_after_step().await;
+
+            // After establishing a DB connection, load any previously saved
+            // settings so we recover progress from prior partial runs.
+            self.try_load_existing_settings().await;
 
             // Step 2: Security
             print_step(2, total_steps, "Security");
             self.step_security().await?;
+            self.persist_after_step().await;
 
             // Step 3: Inference provider selection (unless skipped)
             if !self.config.skip_auth {
@@ -149,22 +160,27 @@ impl SetupWizard {
             } else {
                 print_info("Skipping inference provider setup (using existing config)");
             }
+            self.persist_after_step().await;
 
             // Step 4: Model selection
             print_step(4, total_steps, "Model Selection");
             self.step_model_selection().await?;
+            self.persist_after_step().await;
 
             // Step 5: Embeddings
             print_step(5, total_steps, "Embeddings (Semantic Search)");
             self.step_embeddings()?;
+            self.persist_after_step().await;
 
             // Step 6: Channel configuration
             print_step(6, total_steps, "Channel Configuration");
             self.step_channels().await?;
+            self.persist_after_step().await;
 
             // Step 7: Heartbeat
             print_step(7, total_steps, "Background Tasks");
             self.step_heartbeat()?;
+            self.persist_after_step().await;
         }
 
         // Save settings and print summary
@@ -1453,110 +1469,191 @@ impl SetupWizard {
         Ok(())
     }
 
+    /// Persist current settings to the database.
+    ///
+    /// Returns `Ok(true)` if settings were saved, `Ok(false)` if no database
+    /// connection is available yet (e.g., before Step 1 completes).
+    async fn persist_settings(&self) -> Result<bool, SetupError> {
+        let db_map = self.settings.to_db_map();
+        let saved = false;
+
+        #[cfg(feature = "postgres")]
+        let saved = if !saved {
+            if let Some(ref pool) = self.db_pool {
+                let store = crate::history::Store::from_pool(pool.clone());
+                store
+                    .set_all_settings("default", &db_map)
+                    .await
+                    .map_err(|e| {
+                        SetupError::Database(format!("Failed to save settings to database: {}", e))
+                    })?;
+                true
+            } else {
+                false
+            }
+        } else {
+            saved
+        };
+
+        #[cfg(feature = "libsql")]
+        let saved = if !saved {
+            if let Some(ref backend) = self.db_backend {
+                use crate::db::SettingsStore as _;
+                backend
+                    .set_all_settings("default", &db_map)
+                    .await
+                    .map_err(|e| {
+                        SetupError::Database(format!("Failed to save settings to database: {}", e))
+                    })?;
+                true
+            } else {
+                false
+            }
+        } else {
+            saved
+        };
+
+        Ok(saved)
+    }
+
+    /// Write bootstrap environment variables to `~/.ironclaw/.env`.
+    ///
+    /// These are the chicken-and-egg settings needed before the database is
+    /// connected (DATABASE_BACKEND, DATABASE_URL, LLM_BACKEND, etc.).
+    fn write_bootstrap_env(&self) -> Result<(), SetupError> {
+        let mut env_vars: Vec<(&str, String)> = Vec::new();
+
+        if let Some(ref backend) = self.settings.database_backend {
+            env_vars.push(("DATABASE_BACKEND", backend.clone()));
+        }
+        if let Some(ref url) = self.settings.database_url {
+            env_vars.push(("DATABASE_URL", url.clone()));
+        }
+        if let Some(ref path) = self.settings.libsql_path {
+            env_vars.push(("LIBSQL_PATH", path.clone()));
+        }
+        if let Some(ref url) = self.settings.libsql_url {
+            env_vars.push(("LIBSQL_URL", url.clone()));
+        }
+
+        // LLM bootstrap vars: same chicken-and-egg problem as DATABASE_BACKEND.
+        // Config::from_env() needs the backend before the DB is connected.
+        if let Some(ref backend) = self.settings.llm_backend {
+            env_vars.push(("LLM_BACKEND", backend.clone()));
+        }
+        if let Some(ref url) = self.settings.openai_compatible_base_url {
+            env_vars.push(("LLM_BASE_URL", url.clone()));
+        }
+        if let Some(ref url) = self.settings.ollama_base_url {
+            env_vars.push(("OLLAMA_BASE_URL", url.clone()));
+        }
+
+        // Always write ONBOARD_COMPLETED so that check_onboard_needed()
+        // (which runs before the DB is connected) knows to skip re-onboarding.
+        if self.settings.onboard_completed {
+            env_vars.push(("ONBOARD_COMPLETED", "true".to_string()));
+        }
+
+        if !env_vars.is_empty() {
+            let pairs: Vec<(&str, &str)> = env_vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
+            crate::bootstrap::save_bootstrap_env(&pairs).map_err(|e| {
+                SetupError::Io(std::io::Error::other(format!(
+                    "Failed to save bootstrap env to .env: {}",
+                    e
+                )))
+            })?;
+        }
+
+        Ok(())
+    }
+
+    /// Persist settings to DB and bootstrap .env after each step.
+    ///
+    /// Silently ignores errors (e.g., DB not connected yet before step 1
+    /// completes). This is best-effort incremental persistence.
+    async fn persist_after_step(&self) {
+        // Write bootstrap .env (always possible)
+        if let Err(e) = self.write_bootstrap_env() {
+            tracing::debug!("Could not write bootstrap env after step: {}", e);
+        }
+
+        // Persist to DB
+        match self.persist_settings().await {
+            Ok(true) => tracing::debug!("Settings persisted to database after step"),
+            Ok(false) => tracing::debug!("No DB connection yet, skipping settings persist"),
+            Err(e) => tracing::debug!("Could not persist settings after step: {}", e),
+        }
+    }
+
+    /// Load previously saved settings from the database after Step 1
+    /// establishes a connection.
+    ///
+    /// This enables recovery from partial onboarding runs: if the user
+    /// completed steps 1-4 previously but step 5 failed, re-running
+    /// the wizard will pre-populate settings from the database.
+    async fn try_load_existing_settings(&mut self) {
+        let loaded = false;
+
+        #[cfg(feature = "postgres")]
+        let loaded = if !loaded {
+            if let Some(ref pool) = self.db_pool {
+                let store = crate::history::Store::from_pool(pool.clone());
+                match store.get_all_settings("default").await {
+                    Ok(db_map) if !db_map.is_empty() => {
+                        let existing = Settings::from_db_map(&db_map);
+                        self.settings.merge_from(&existing);
+                        tracing::info!("Loaded {} existing settings from database", db_map.len());
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(e) => {
+                        tracing::debug!("Could not load existing settings: {}", e);
+                        false
+                    }
+                }
+            } else {
+                false
+            }
+        } else {
+            loaded
+        };
+
+        #[cfg(feature = "libsql")]
+        if !loaded && let Some(ref backend) = self.db_backend {
+            use crate::db::SettingsStore as _;
+            match backend.get_all_settings("default").await {
+                Ok(db_map) if !db_map.is_empty() => {
+                    let existing = Settings::from_db_map(&db_map);
+                    self.settings.merge_from(&existing);
+                    tracing::info!("Loaded {} existing settings from database", db_map.len());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!("Could not load existing settings: {}", e);
+                }
+            }
+        }
+
+        #[cfg(not(feature = "libsql"))]
+        let _ = loaded;
+    }
+
     /// Save settings to the database and `~/.ironclaw/.env`, then print summary.
     async fn save_and_summarize(&mut self) -> Result<(), SetupError> {
         self.settings.onboard_completed = true;
 
-        // Write all settings to the database (whichever backend is active).
-        {
-            let db_map = self.settings.to_db_map();
-            let saved = false;
+        // Final persist (idempotent — earlier incremental saves already wrote
+        // most settings, but this ensures onboard_completed is saved).
+        let saved = self.persist_settings().await?;
 
-            #[cfg(feature = "postgres")]
-            let saved = if !saved {
-                if let Some(ref pool) = self.db_pool {
-                    let store = crate::history::Store::from_pool(pool.clone());
-                    store
-                        .set_all_settings("default", &db_map)
-                        .await
-                        .map_err(|e| {
-                            SetupError::Database(format!(
-                                "Failed to save settings to database: {}",
-                                e
-                            ))
-                        })?;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                saved
-            };
-
-            #[cfg(feature = "libsql")]
-            let saved = if !saved {
-                if let Some(ref backend) = self.db_backend {
-                    use crate::db::SettingsStore as _;
-                    backend
-                        .set_all_settings("default", &db_map)
-                        .await
-                        .map_err(|e| {
-                            SetupError::Database(format!(
-                                "Failed to save settings to database: {}",
-                                e
-                            ))
-                        })?;
-                    true
-                } else {
-                    false
-                }
-            } else {
-                saved
-            };
-
-            if !saved {
-                return Err(SetupError::Database(
-                    "No database connection, cannot save settings".to_string(),
-                ));
-            }
+        if !saved {
+            return Err(SetupError::Database(
+                "No database connection, cannot save settings".to_string(),
+            ));
         }
 
-        // Persist database bootstrap vars to ~/.ironclaw/.env.
-        // These are the chicken-and-egg settings: we need them to decide
-        // which database to connect to, so they can't live in the database.
-        {
-            let mut env_vars: Vec<(&str, String)> = Vec::new();
-
-            if let Some(ref backend) = self.settings.database_backend {
-                env_vars.push(("DATABASE_BACKEND", backend.clone()));
-            }
-            if let Some(ref url) = self.settings.database_url {
-                env_vars.push(("DATABASE_URL", url.clone()));
-            }
-            if let Some(ref path) = self.settings.libsql_path {
-                env_vars.push(("LIBSQL_PATH", path.clone()));
-            }
-            if let Some(ref url) = self.settings.libsql_url {
-                env_vars.push(("LIBSQL_URL", url.clone()));
-            }
-
-            // LLM bootstrap vars: same chicken-and-egg problem as DATABASE_BACKEND.
-            // Config::from_env() needs the backend before the DB is connected.
-            if let Some(ref backend) = self.settings.llm_backend {
-                env_vars.push(("LLM_BACKEND", backend.clone()));
-            }
-            if let Some(ref url) = self.settings.openai_compatible_base_url {
-                env_vars.push(("LLM_BASE_URL", url.clone()));
-            }
-            if let Some(ref url) = self.settings.ollama_base_url {
-                env_vars.push(("OLLAMA_BASE_URL", url.clone()));
-            }
-
-            // Always write ONBOARD_COMPLETED so that check_onboard_needed()
-            // (which runs before the DB is connected) knows to skip re-onboarding.
-            env_vars.push(("ONBOARD_COMPLETED", "true".to_string()));
-
-            if !env_vars.is_empty() {
-                let pairs: Vec<(&str, &str)> =
-                    env_vars.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                crate::bootstrap::save_bootstrap_env(&pairs).map_err(|e| {
-                    SetupError::Io(std::io::Error::other(format!(
-                        "Failed to save bootstrap env to .env: {}",
-                        e
-                    )))
-                })?;
-            }
-        }
+        // Write bootstrap env (also idempotent)
+        self.write_bootstrap_env()?;
 
         println!();
         print_success("Configuration saved to database");
