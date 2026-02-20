@@ -220,8 +220,8 @@ impl SessionManager {
     /// Start the login flow.
     ///
     /// Shows the auth method menu FIRST (before binding any listener), so
-    /// that the manual-token path can skip network binding entirely. This
-    /// is important for remote/headless servers where `127.0.0.1` is
+    /// that the API-key path can skip network binding entirely. This is
+    /// important for remote/headless servers where `127.0.0.1` is
     /// unreachable from the user's browser.
     ///
     /// For OAuth paths (GitHub, Google):
@@ -230,10 +230,10 @@ impl SessionManager {
     /// 3. Wait for OAuth callback with session token
     /// 4. Save and return the token
     ///
-    /// For manual token paste:
-    /// 1. Prompt user to paste session token from NEAR AI web
-    /// 2. Validate via /v1/users/me
-    /// 3. Save and return the token
+    /// For NEAR AI Cloud API key:
+    /// 1. Prompt user for API key from cloud.near.ai
+    /// 2. Set NEARAI_API_KEY env var and save to bootstrap .env
+    /// 3. No session token saved (different auth model)
     async fn initiate_login(&self) -> Result<(), LlmError> {
         use crate::cli::oauth_defaults;
 
@@ -246,10 +246,10 @@ impl SessionManager {
         println!("╠════════════════════════════════════════════════════════════════╣");
         println!("║  Choose an authentication method:                              ║");
         println!("║                                                                ║");
-        println!("║    [1] GitHub                                                  ║");
-        println!("║    [2] Google                                                  ║");
+        println!("║    [1] GitHub            (requires localhost browser access)    ║");
+        println!("║    [2] Google            (requires localhost browser access)    ║");
         println!("║    [3] NEAR Wallet (coming soon)                               ║");
-        println!("║    [4] Paste session token (remote/headless servers)            ║");
+        println!("║    [4] NEAR AI Cloud API key                                   ║");
         println!("║                                                                ║");
         println!("╚════════════════════════════════════════════════════════════════╝");
         println!();
@@ -269,7 +269,7 @@ impl SessionManager {
             })?;
 
         match choice.trim() {
-            "4" => return self.manual_token_login().await,
+            "4" => return self.api_key_login().await,
             "3" => {
                 println!();
                 println!("NEAR Wallet authentication is not yet implemented.");
@@ -360,75 +360,58 @@ impl SessionManager {
         Ok(())
     }
 
-    /// Manual token paste flow for remote/headless servers.
+    /// NEAR AI Cloud API key entry flow.
     ///
-    /// Prompts the user to log into NEAR AI via their browser, copy the
-    /// session token, and paste it here. No local listener is needed.
-    async fn manual_token_login(&self) -> Result<(), LlmError> {
+    /// Prompts the user to enter a NEAR AI Cloud API key from
+    /// cloud.near.ai. The key is set as `NEARAI_API_KEY` env var so
+    /// `LlmConfig::resolve()` auto-selects ChatCompletions mode, and
+    /// saved to `~/.ironclaw/.env` for persistence across restarts.
+    /// No session token is saved and no `/v1/users/me` validation is
+    /// performed (different auth model).
+    async fn api_key_login(&self) -> Result<(), LlmError> {
         println!();
-        println!("Manual session token entry");
-        println!("─────────────────────────");
+        println!("NEAR AI Cloud API key");
+        println!("─────────────────────");
         println!();
-        println!("  1. Open https://app.near.ai in your browser");
-        println!("  2. Log in with GitHub or Google");
-        println!("  3. Go to Settings → API Keys (or generate a session token)");
-        println!("  4. Copy the session token (starts with 'sess_')");
+        println!("  1. Open https://cloud.near.ai in your browser");
+        println!("  2. Sign in and navigate to API Keys");
+        println!("  3. Create or copy an existing API key");
         println!();
-        print!("Paste session token: ");
 
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-
-        let mut token_input = String::new();
-        std::io::stdin().read_line(&mut token_input).map_err(|e| {
-            LlmError::SessionRenewalFailed {
+        let key_secret =
+            crate::setup::secret_input("API key").map_err(|e| LlmError::SessionRenewalFailed {
                 provider: "nearai".to_string(),
                 reason: format!("Failed to read input: {}", e),
-            }
-        })?;
-
-        let token = token_input.trim().to_string();
-        if token.is_empty() {
-            return Err(LlmError::SessionRenewalFailed {
-                provider: "nearai".to_string(),
-                reason: "Session token cannot be empty".to_string(),
-            });
-        }
-
-        // Validate the token immediately
-        println!("Validating token...");
-        let url = format!("{}/v1/users/me", self.config.auth_base_url);
-        let response = self
-            .client
-            .get(&url)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await
-            .map_err(|e| LlmError::SessionRenewalFailed {
-                provider: "nearai".to_string(),
-                reason: format!("Validation request failed: {}", e),
             })?;
 
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
+        use secrecy::ExposeSecret;
+        let key = key_secret.expose_secret().to_string();
+        if key.is_empty() {
             return Err(LlmError::SessionRenewalFailed {
                 provider: "nearai".to_string(),
-                reason: format!("Token validation failed: HTTP {}: {}", status, body),
+                reason: "API key cannot be empty".to_string(),
             });
         }
 
-        // Save the token
-        self.save_session(&token, Some("manual")).await?;
+        // Set env var so Config picks it up immediately
+        // (LlmConfig::resolve() auto-selects ChatCompletions mode when
+        // NEARAI_API_KEY is present).
+        //
+        // SAFETY: called during single-threaded interactive login flow.
+        #[allow(unused_unsafe)]
+        unsafe {
+            std::env::set_var("NEARAI_API_KEY", &key);
+        }
 
-        // Update in-memory token
-        {
-            let mut guard = self.token.write().await;
-            *guard = Some(SecretString::from(token));
+        // Persist to ~/.ironclaw/.env so the key survives restarts
+        // (bootstrap layer — available before DB is connected).
+        // Uses upsert to avoid clobbering existing bootstrap vars.
+        if let Err(e) = crate::bootstrap::upsert_bootstrap_var("NEARAI_API_KEY", &key) {
+            tracing::warn!("Failed to save API key to bootstrap .env: {}", e);
         }
 
         println!();
-        println!("✓ Authentication successful!");
+        println!("✓ NEAR AI Cloud API key saved.");
         println!();
 
         Ok(())

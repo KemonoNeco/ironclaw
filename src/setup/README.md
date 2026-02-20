@@ -166,7 +166,7 @@ env-var mode or skipped secrets.
 
 | Provider | Auth Method | Secret Name | Env Var |
 |----------|-------------|-------------|---------|
-| NEAR AI | Browser OAuth | (session token) | `NEARAI_SESSION_TOKEN` |
+| NEAR AI | Browser OAuth or API key | `llm_nearai_api_key` (API key path) | `NEARAI_API_KEY` |
 | Anthropic | API key | `anthropic_api_key` | `ANTHROPIC_API_KEY` |
 | OpenAI | API key | `openai_api_key` | `OPENAI_API_KEY` |
 | Ollama | None | - | - |
@@ -179,8 +179,13 @@ env-var mode or skipped secrets.
 4. **Cache key in `self.llm_api_key`** for model fetching in Step 4
 
 **NEAR AI** (`setup_nearai`):
-- Calls `session_manager.ensure_authenticated()` which opens browser
-- Session token saved to `~/.ironclaw/session.json`
+- Calls `session_manager.ensure_authenticated()` which shows the auth menu:
+  - Options 1-2 (GitHub/Google): browser OAuth, requires localhost access
+  - Option 4: NEAR AI Cloud API key from `cloud.near.ai`
+- OAuth path: session token saved to `~/.ironclaw/session.json`
+- API key path: `NEARAI_API_KEY` saved to `~/.ironclaw/.env` (bootstrap)
+  and encrypted secrets store (`llm_nearai_api_key`). `LlmConfig::resolve()`
+  auto-selects `ChatCompletions` mode when the API key is present.
 
 **`self.llm_api_key` caching:** The wizard caches the API key as
 `Option<SecretString>` so that Step 4 (model fetching) and Step 5
@@ -517,9 +522,11 @@ local browser.
 
 **Solutions:**
 
-1. **Manual token paste (option 4 in auth menu):** The user logs into
-   NEAR AI via their local browser, copies the session token, and pastes
-   it into the terminal. No local listener is needed.
+1. **NEAR AI Cloud API key (option 4 in auth menu):** Get an API key
+   from `https://cloud.near.ai` and paste it into the terminal. No
+   local listener is needed. The key is saved to `~/.ironclaw/.env`
+   and the encrypted secrets store. Uses the OpenAI-compatible
+   ChatCompletions API mode.
 
 2. **Custom callback URL:** Set `IRONCLAW_OAUTH_CALLBACK_URL` to a
    publicly accessible URL (e.g., via SSH tunnel or reverse proxy) that

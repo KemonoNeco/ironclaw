@@ -718,6 +718,20 @@ impl SetupWizard {
             .map_err(|e| SetupError::Auth(e.to_string()))?;
 
         self.session_manager = Some(session);
+
+        // If the user chose the API key path, NEARAI_API_KEY is now set
+        // in the environment. Persist it to the encrypted secrets store
+        // so inject_llm_keys_from_secrets() can load it on future runs.
+        if let Ok(api_key) = std::env::var("NEARAI_API_KEY")
+            && !api_key.is_empty()
+            && let Ok(ctx) = self.init_secrets_context().await
+        {
+            let key = SecretString::from(api_key);
+            if let Err(e) = ctx.save_secret("llm_nearai_api_key", &key).await {
+                tracing::warn!("Failed to persist NEARAI_API_KEY to secrets: {}", e);
+            }
+        }
+
         print_success("NEAR AI configured");
         Ok(())
     }
@@ -1548,6 +1562,13 @@ impl SetupWizard {
             env_vars.push(("OLLAMA_BASE_URL", url.clone()));
         }
 
+        // Preserve NEARAI_API_KEY if present (set by API key auth flow)
+        if let Ok(api_key) = std::env::var("NEARAI_API_KEY")
+            && !api_key.is_empty()
+        {
+            env_vars.push(("NEARAI_API_KEY", api_key));
+        }
+
         // Always write ONBOARD_COMPLETED so that check_onboard_needed()
         // (which runs before the DB is connected) knows to skip re-onboarding.
         if self.settings.onboard_completed {
@@ -1619,22 +1640,30 @@ impl SetupWizard {
         };
 
         #[cfg(feature = "libsql")]
-        if !loaded && let Some(ref backend) = self.db_backend {
-            use crate::db::SettingsStore as _;
-            match backend.get_all_settings("default").await {
-                Ok(db_map) if !db_map.is_empty() => {
-                    let existing = Settings::from_db_map(&db_map);
-                    self.settings.merge_from(&existing);
-                    tracing::info!("Loaded {} existing settings from database", db_map.len());
+        let loaded = if !loaded {
+            if let Some(ref backend) = self.db_backend {
+                use crate::db::SettingsStore as _;
+                match backend.get_all_settings("default").await {
+                    Ok(db_map) if !db_map.is_empty() => {
+                        let existing = Settings::from_db_map(&db_map);
+                        self.settings.merge_from(&existing);
+                        tracing::info!("Loaded {} existing settings from database", db_map.len());
+                        true
+                    }
+                    Ok(_) => false,
+                    Err(e) => {
+                        tracing::debug!("Could not load existing settings: {}", e);
+                        false
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::debug!("Could not load existing settings: {}", e);
-                }
+            } else {
+                false
             }
-        }
+        } else {
+            loaded
+        };
 
-        #[cfg(not(feature = "libsql"))]
+        // Suppress unused variable warning when only one backend is compiled.
         let _ = loaded;
     }
 
