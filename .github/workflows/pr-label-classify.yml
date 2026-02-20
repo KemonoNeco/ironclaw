@@ -1,7 +1,7 @@
 name: "PR: Classify (Size, Risk, Contributor)"
 
 on:
-  pull_request_target:
+  pull_request:          # TODO: switch back to pull_request_target before merge
     types: [opened, synchronize, reopened]
 
 permissions:
@@ -13,10 +13,8 @@ jobs:
   classify:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout base branch
+      - name: Checkout PR branch
         uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.ref }}
 
       - name: Classify PR
         env:
