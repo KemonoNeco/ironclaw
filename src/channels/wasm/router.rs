@@ -42,6 +42,8 @@ pub struct WasmChannelRouter {
     secrets: RwLock<HashMap<String, String>>,
     /// Webhook secret header names by channel name (e.g., "X-Telegram-Bot-Api-Secret-Token").
     secret_headers: RwLock<HashMap<String, String>>,
+    /// Ed25519 public keys for signature verification by channel name (hex-encoded).
+    signature_keys: RwLock<HashMap<String, String>>,
 }
 
 impl WasmChannelRouter {
@@ -52,6 +54,7 @@ impl WasmChannelRouter {
             path_to_channel: RwLock::new(HashMap::new()),
             secrets: RwLock::new(HashMap::new()),
             secret_headers: RwLock::new(HashMap::new()),
+            signature_keys: RwLock::new(HashMap::new()),
         }
     }
 
@@ -130,6 +133,7 @@ impl WasmChannelRouter {
         self.channels.write().await.remove(channel_name);
         self.secrets.write().await.remove(channel_name);
         self.secret_headers.write().await.remove(channel_name);
+        self.signature_keys.write().await.remove(channel_name);
 
         // Remove all paths for this channel
         self.path_to_channel
@@ -179,16 +183,18 @@ impl WasmChannelRouter {
     ///
     /// Channels with a registered key will have Discord-style Ed25519
     /// signature validation performed before forwarding to WASM.
-    pub async fn register_signature_key(&self, _channel_name: &str, _public_key_hex: &str) {
-        // STUB: intentionally does nothing to fail tests during Red phase
+    pub async fn register_signature_key(&self, channel_name: &str, public_key_hex: &str) {
+        self.signature_keys
+            .write()
+            .await
+            .insert(channel_name.to_string(), public_key_hex.to_string());
     }
 
     /// Get the signature verification key for a channel.
     ///
     /// Returns `None` if no key is registered (no signature check needed).
-    pub async fn get_signature_key(&self, _channel_name: &str) -> Option<String> {
-        // STUB: intentionally returns None to fail tests during Red phase
-        None
+    pub async fn get_signature_key(&self, channel_name: &str) -> Option<String> {
+        self.signature_keys.read().await.get(channel_name).cloned()
     }
 }
 
@@ -671,9 +677,7 @@ mod tests {
         router.register(channel, vec![], None, None).await;
 
         let fake_pub_key = "a]b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1";
-        router
-            .register_signature_key("discord", fake_pub_key)
-            .await;
+        router.register_signature_key("discord", fake_pub_key).await;
 
         let key = router.get_signature_key("discord").await;
         assert_eq!(key, Some(fake_pub_key.to_string()));
@@ -703,9 +707,7 @@ mod tests {
         }];
 
         router.register(channel, endpoints, None, None).await;
-        router
-            .register_signature_key("discord", "deadbeef")
-            .await;
+        router.register_signature_key("discord", "deadbeef").await;
 
         // Key should exist
         assert!(router.get_signature_key("discord").await.is_some());

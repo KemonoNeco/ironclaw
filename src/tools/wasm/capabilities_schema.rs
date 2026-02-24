@@ -61,17 +61,51 @@ pub struct CapabilitiesFile {
     /// Used by `ironclaw config` to guide users through auth setup.
     #[serde(default)]
     pub auth: Option<AuthCapabilitySchema>,
+
+    /// Nested capabilities wrapper for channel-level JSON compatibility.
+    ///
+    /// Channel capabilities files nest tool capabilities under a `"capabilities"` key.
+    /// This allows `from_json()`/`from_bytes()` to also parse channel-level JSON;
+    /// inner fields are promoted into top-level fields by `resolve_nested()`.
+    /// Always `None` after construction via the public parse methods.
+    #[serde(default, skip_serializing)]
+    pub capabilities: Option<Box<CapabilitiesFile>>,
 }
 
 impl CapabilitiesFile {
     /// Parse from JSON string.
     pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
-        serde_json::from_str(json)
+        serde_json::from_str::<Self>(json).map(Self::resolve_nested)
     }
 
     /// Parse from JSON bytes.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, serde_json::Error> {
-        serde_json::from_slice(bytes)
+        serde_json::from_slice::<Self>(bytes).map(Self::resolve_nested)
+    }
+
+    /// Merge nested `capabilities` wrapper into top-level fields.
+    ///
+    /// Channel-level JSON nests tool capabilities under `"capabilities"`.
+    /// This promotes the inner fields so callers can access them uniformly.
+    fn resolve_nested(mut self) -> Self {
+        if let Some(inner) = self.capabilities.take() {
+            if self.http.is_none() {
+                self.http = inner.http;
+            }
+            if self.secrets.is_none() {
+                self.secrets = inner.secrets;
+            }
+            if self.tool_invoke.is_none() {
+                self.tool_invoke = inner.tool_invoke;
+            }
+            if self.workspace.is_none() {
+                self.workspace = inner.workspace;
+            }
+            if self.auth.is_none() {
+                self.auth = inner.auth;
+            }
+        }
+        self
     }
 
     /// Convert to runtime Capabilities.
@@ -234,6 +268,7 @@ pub enum CredentialLocationSchema {
 
     /// Custom header.
     Header {
+        #[serde(alias = "header_name")]
         name: String,
         #[serde(default)]
         prefix: Option<String>,

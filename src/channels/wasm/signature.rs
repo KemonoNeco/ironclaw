@@ -14,14 +14,36 @@
 ///
 /// Returns `true` if the signature is valid, `false` on any error
 /// (bad hex, wrong length, invalid signature, etc.).
+#[allow(dead_code)] // Called from router webhook_handler in a future step
 pub fn verify_discord_signature(
-    _public_key_hex: &str,
-    _signature_hex: &str,
-    _timestamp: &str,
-    _body: &[u8],
+    public_key_hex: &str,
+    signature_hex: &str,
+    timestamp: &str,
+    body: &[u8],
 ) -> bool {
-    // STUB: intentionally returns false to fail tests during Red phase
-    false
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    let Ok(sig_bytes) = hex::decode(signature_hex) else {
+        return false;
+    };
+    let Ok(key_bytes) = hex::decode(public_key_hex) else {
+        return false;
+    };
+    let Ok(sig_array): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        return false;
+    };
+    let Ok(key_array): Result<[u8; 32], _> = key_bytes.try_into() else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&key_array) else {
+        return false;
+    };
+    let signature = Signature::from_bytes(&sig_array);
+
+    let mut message = Vec::with_capacity(timestamp.len() + body.len());
+    message.extend_from_slice(timestamp.as_bytes());
+    message.extend_from_slice(body);
+    verifying_key.verify_strict(&message, &signature).is_ok()
 }
 
 #[cfg(test)]
@@ -199,12 +221,7 @@ mod tests {
 
         // Same key, but tampered body should fail
         assert!(
-            !verify_discord_signature(
-                &public_key_hex,
-                &signature_hex,
-                timestamp,
-                br#"{"type":2}"#
-            ),
+            !verify_discord_signature(&public_key_hex, &signature_hex, timestamp, br#"{"type":2}"#),
             "Reference vector with tampered body should fail"
         );
     }
