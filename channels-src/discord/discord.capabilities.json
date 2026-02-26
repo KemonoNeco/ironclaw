@@ -44,6 +44,9 @@
       "emit_rate_limit": {
         "messages_per_minute": 100,
         "messages_per_hour": 5000
+      },
+      "webhook": {
+        "signature_key_secret_name": "discord_public_key"
       }
     }
   },
