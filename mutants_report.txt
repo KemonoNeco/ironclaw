@@ -1,0 +1,29 @@
+# Cargo Mutants Report
+
+## Summary
+Attempted to run mutation testing on the `ironclaw` project using `cargo mutants`.
+
+## Findings
+
+1. **Large Scale**: The project contains **8438 mutants** in total when targeting the full codebase.
+2. **Compilation Constraints**: The project has heavy dependencies including:
+   - `wasmtime` (v28)
+   - `libsql` (v0.6)
+   - `pgvector`
+   - `axum`, `tokio-postgres`, etc.
+
+   These dependencies result in very long compilation times (exceeding 10+ minutes) in the test environment, causing `cargo mutants` (and even `cargo test`) to time out during the baseline compilation phase.
+
+3. **Focused Attempt**:
+   - Targeted `src/util.rs` specifically.
+   - Found **12 mutants** in this file.
+   - Baseline compilation for this subset also timed out due to the need to link the main binary with all dependencies.
+
+## Broken Tests
+Unable to confirm broken tests as the test suite could not complete compilation within the available time.
+
+## Recommendation
+To run mutation testing effectively on this project:
+- Use a machine with more powerful CPU/RAM or longer timeout limits.
+- Use `cargo mutants --in-place` (with caution) to avoid full rebuilds, or pre-compile dependencies in the mutation sandbox.
+- Isolate unit tests into a separate crate or configuration that doesn't require linking heavy integration dependencies like `wasmtime` if possible.

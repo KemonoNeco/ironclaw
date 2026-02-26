@@ -19,3 +19,14 @@ bench-results/
 # WASM build artifacts (loaded from disk, not bundled)
 *.wasm
 
+mutants.out
+mutants_output.txt
+mutants.out/
+mutants_output.txt
+cargo_install_output.txt
+mutants.out.old/
+test_output.txt
+test_output_2.txt
+mutants_util_output.txt
+test_output_3.txt
+clippy_output.txt
