@@ -522,3 +522,4 @@
     Checking testcontainers-modules v0.11.6
     Checking tokio-test v0.4.5
     Checking tempfile v3.25.0
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4m 55s

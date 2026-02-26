@@ -7,7 +7,7 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: read           # needed for search/issues API (contributor count)
+  issues: write          # needed for label creation and search/issues API
 
 jobs:
   classify:
@@ -17,6 +17,11 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.base.ref }}
+
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/create-labels.sh
 
       - name: Classify PR
         env:
